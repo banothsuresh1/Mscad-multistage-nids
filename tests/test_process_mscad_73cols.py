@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
-"""End-to-end test of preprocessing/process_mscad_73cols.py on SYNTHETIC data.
+"""Tests for preprocessing/process_mscad_73cols.py.
 
-The synthetic reference has the real MSCAD shape (128,799 x 67, quoted headers,
-exact Kaggle class counts). The six synthetic CICFlowMeter files contain known
-numbers of signature matches, ambiguous and prohibited signatures, unmatched
-victim/external flows, Infinity/NaN values, a duplicate ``Fwd Header Len.1``
-column, a repeated header line, padded headers and an invalid timestamp, so
-every count the pipeline reports can be checked exactly.
+Three kinds of tests:
 
-Run:  python tests/test_process_mscad_73cols.py      (or: pytest tests/)
+* Full-scale SYNTHETIC run. A synthetic Kaggle reference with the real shape and class counts
+  (128,799 x 67, quoted headers) and six synthetic CICFlowMeter captures with exactly the verified
+  extracted row counts (21 / 641 / 45 / 11,081 / 26 / 88,526 = 100,340), structured like the real data:
+  W-B-02 = 88,501 one-to-one Brute_Force flows + 8 extra copies + 17 attack-session fragments absent from
+  the reference (one reference row not reproduced), and a W-B-01 line that lost its Flow ID and the start
+  of its Src IP. Collisions are planted on purpose: App-01 flows whose signatures the reference also (or
+  only) associates with Normal, 12-feature signatures shared by Brute_Force and Normal, a W-B-02 flow
+  identical to a Port_Scan reference row, duplicated reference rows, and Infinity values.
+* Small synthetic fixtures for the edge cases of the matching logic.
+* Checks of the REAL outputs (default D:\\mscad\\CSV_73Cols, or the MSCAD_OUTPUT_DIR environment
+  variable). They are skipped, with the reason shown, when those outputs do not exist.
+
+Run:  pytest -q tests/test_process_mscad_73cols.py      (or: python tests/test_process_mscad_73cols.py)
 """
 
 from __future__ import annotations
 
+import atexit
+import hashlib
+import logging
+import os
 import shutil
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -25,252 +37,816 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "preprocessing"))
 import process_mscad_73cols as pm  # noqa: E402
 
+# Verified ground truth, stated here independently of the module's configuration.
+EXPECTED_DISTRIBUTION = {
+    "N-0.pcap_Flow.csv": {"Normal": 21},
+    "App-01.pcap_Flow.csv": {"HTTP_DDoS": 641},
+    "App-02.pcap_Flow.csv": {"ICMP_Flood": 45},
+    "Scan-1.pcap_Flow.csv": {"Port_Scan": 11_081},
+    "W-B-01.pcap_Flow.csv": {"Web_Crwling": 26},
+    "W-B-02.pcap_Flow.csv": {"Brute_Force": 88_526},
+}
+EXPECTED_ROWS = {f: sum(d.values()) for f, d in EXPECTED_DISTRIBUTION.items()}
+KAGGLE_COUNTS = {"Brute_Force": 88_502, "Normal": 28_502, "Port_Scan": 11_081,
+                 "HTTP_DDoS": 641, "ICMP_Flood": 45, "Web_Crwling": 28}
+METADATA = ["Src IP", "Src Port", "Dst IP", "Dst Port", "Protocol", "Timestamp"]
+TS_FORMAT = "%d/%m/%Y %H:%M:%S"
+TS_FORMAT_AMPM = "%d/%m/%Y %I:%M:%S %p"   # the format CICFlowMeter wrote for the real W-B-01/W-B-02
+ATTACK_SESSION = {"Src IP": "192.168.159.1", "Dst IP": "192.168.159.131", "Dst Port": "80", "Protocol": "6"}
+FEAT = pm.FEATURE_COLUMNS
+SIG = pm.SIGNATURE_COLUMNS
+
 RAW_ORDER = (
     ["Flow ID", "Src IP", "Src Port", "Dst IP", "Dst Port", "Protocol", "Timestamp"]
-    + pm.FEATURE_COLUMNS[:29]
+    + FEAT[:29]
     + ["Fwd PSH Flags", "Bwd PSH Flags", "Fwd URG Flags", "Bwd URG Flags"]
-    + pm.FEATURE_COLUMNS[31:52]
+    + FEAT[31:52]
     + ["Fwd Byts/b Avg", "Fwd Pkts/b Avg", "Fwd Blk Rate Avg", "Bwd Byts/b Avg", "Bwd Pkts/b Avg", "Bwd Blk Rate Avg"]
-    + pm.FEATURE_COLUMNS[52:56]
+    + FEAT[52:56]
     + ["Init Fwd Win Byts", "Init Bwd Win Byts", "Fwd Act Data Pkts", "Fwd Seg Size Min"]
-    + pm.FEATURE_COLUMNS[58:]
+    + FEAT[58:]
     + ["Label"]
 )
-assert len(RAW_ORDER) == 84 and set(pm.FEATURE_COLUMNS) <= set(RAW_ORDER)
-
-rng = np.random.default_rng(7)
+assert len(RAW_ORDER) == 84 and set(FEAT) <= set(RAW_ORDER)
 
 
-def make_reference() -> pd.DataFrame:
-    n = sum(pm.EXPECTED_CLASS_COUNTS.values())
-    labels = np.concatenate([[lab] * c for lab, c in pm.EXPECTED_CLASS_COUNTS.items()])
-    ref = pd.DataFrame({c: rng.random(n).round(6) * 1000 for c in pm.FEATURE_COLUMNS})
-    for c in pm.SIGNATURE_COLUMNS:  # integer-valued, effectively unique signatures
-        ref[c] = rng.integers(0, 10**12, n)
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _reset_log():
+    for handler in list(pm.LOG.handlers):
+        pm.LOG.removeHandler(handler)
+        handler.close()
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def run_pipeline(*argv, capture: _Capture | None = None) -> int:
+    _reset_log()
+    if capture is not None:
+        pm.LOG.addHandler(capture)
+        pm.LOG.setLevel(logging.INFO)
+    try:
+        return pm.main([str(a) for a in argv])
+    finally:
+        _reset_log()
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_output(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
+
+
+def copy_rows(df: pd.DataFrame, dst, src, columns) -> None:
+    """Copy feature values from rows ``src`` to rows ``dst`` column by column (keeps dtypes)."""
+    for col in columns:
+        df.loc[dst, col] = df.loc[src, col].to_numpy()
+
+
+# =============================================================================
+# Full-scale synthetic dataset
+# =============================================================================
+
+
+def build_reference(rng) -> tuple[pd.DataFrame, dict]:
+    n = sum(KAGGLE_COUNTS.values())
+    labels = np.concatenate([[lab] * c for lab, c in KAGGLE_COUNTS.items()])
+    ref = pd.DataFrame({c: (rng.random(n) * 1000).round(6) for c in FEAT})
+    for c in SIG:
+        ref[c] = rng.integers(0, 10**12, n).astype("float64")
     ref["Label"] = labels
-    idx = {lab: np.flatnonzero(labels == lab) for lab in pm.LABEL_ENCODING}
-    # 5 ambiguous signatures: Normal rows copy Brute_Force signatures.
-    for k in range(5):
-        ref.loc[idx["Normal"][k], pm.SIGNATURE_COLUMNS] = ref.loc[idx["Brute_Force"][k], pm.SIGNATURE_COLUMNS].values
-    # 3 repeated signatures with a single label (Port_Scan).
-    for k in range(3):
-        ref.loc[idx["Port_Scan"][100 + k], pm.SIGNATURE_COLUMNS] = ref.loc[idx["Port_Scan"][k], pm.SIGNATURE_COLUMNS].values
+    idx = {lab: np.flatnonzero(labels == lab) for lab in KAGGLE_COUNTS}
+    B, N, H, P = idx["Brute_Force"], idx["Normal"], idx["HTTP_DDoS"], idx["Port_Scan"]
+    copy_rows(ref, N[0:5], B[0:5], SIG)        # 12-feature signature shared by Brute_Force and Normal
+    copy_rows(ref, N[5:10], H[0:5], FEAT)      # all 66 features shared by HTTP_DDoS and Normal
+    copy_rows(ref, P[0:1], B[10:11], FEAT)     # Port_Scan reference row identical to a Brute_Force row
+    copy_rows(ref, B[21:22], B[20:21], FEAT)   # duplicated Brute_Force reference row
     return ref, idx
 
 
-def victim_ip():
-    return f"192.168.159.{rng.integers(1, 255)}"
+def random_meta(rng, n: int) -> pd.DataFrame:
+    secs = rng.integers(0, 60 * 86_400, n)  # spans two months: day-first strings do not sort lexicographically
+    return pd.DataFrame({
+        "Src IP": [f"10.0.{a}.{b}" for a, b in zip(rng.integers(0, 255, n), rng.integers(1, 255, n))],
+        "Src Port": rng.integers(1024, 65535, n).astype(str),
+        "Dst IP": [f"192.168.159.{a}" for a in rng.integers(1, 255, n)],
+        "Dst Port": "80",
+        "Protocol": "6",
+        "Timestamp": (pd.Timestamp("2021-01-05") + pd.to_timedelta(secs, unit="s")).strftime(TS_FORMAT),
+    })
 
 
-def external_ip():
-    return f"10.0.{rng.integers(0, 255)}.{rng.integers(1, 255)}"
-
-
-def raw_rows(ref: pd.DataFrame, rows, src_fn, dst_fn) -> pd.DataFrame:
-    part = ref.loc[rows, pm.FEATURE_COLUMNS].reset_index(drop=True)
-    n = len(part)
-    part.insert(0, "Src IP", [src_fn() for _ in range(n)])
-    part.insert(1, "Dst IP", [dst_fn() for _ in range(n)])
-    return part
-
-
-def unmatched_rows(n, src_fn, dst_fn) -> pd.DataFrame:
-    part = pd.DataFrame({c: rng.random(n) * 1000 for c in pm.FEATURE_COLUMNS})
-    for c in pm.SIGNATURE_COLUMNS:
-        part[c] = rng.integers(10**13, 10**14, n)  # never in the reference
-    part.insert(0, "Src IP", [src_fn() for _ in range(n)])
-    part.insert(1, "Dst IP", [dst_fn() for _ in range(n)])
-    return part
-
-
-def finish_raw(df: pd.DataFrame) -> pd.DataFrame:
+def write_capture(path: Path, part: pd.DataFrame, rng, meta: pd.DataFrame | None = None, *, pad_headers=False,
+                  duplicate_fwd_header=False, repeated_header_at=None, corrupt_row=None) -> None:
+    """Write a CICFlowMeter-style CSV. ``corrupt_row`` (index into ``part``) is written like the real broken
+    W-B-01 line: its Flow ID field and the start of its Src IP are lost, so the line has one field too few."""
+    df = part.reset_index(drop=True).copy()
     n = len(df)
-    df = df.sample(frac=1.0, random_state=int(rng.integers(0, 10**6))).reset_index(drop=True)
-    secs = rng.integers(0, 86_000, n)
-    df["Timestamp"] = [(pd.Timestamp("2021-03-15") + pd.Timedelta(seconds=int(s))).strftime("%d/%m/%Y %H:%M:%S") for s in secs]
-    df["Src Port"] = rng.integers(1024, 65535, n).astype(str)
-    df["Dst Port"] = "80"
-    df["Protocol"] = "6"
+    meta = random_meta(rng, n) if meta is None else meta.reset_index(drop=True)
+    for c in METADATA:
+        df[c] = meta[c].to_numpy()
+    df["__order"] = np.arange(n)
+    df = df.sample(frac=1.0, random_state=int(rng.integers(0, 2**31))).reset_index(drop=True)
+    corrupt_pos = None if corrupt_row is None else int(np.flatnonzero(df["__order"].to_numpy() == corrupt_row)[0])
+    df = df.drop(columns="__order")
     df["Flow ID"] = df["Src IP"] + "-" + df["Dst IP"]
     for c in pm.DROP_COLUMNS[1:]:
         df[c] = 0
     df["Label"] = "No Label"
-    df["Flow Duration"] = df["Flow Duration"].astype(float)  # written as "123.0": format must not matter
-    return df[RAW_ORDER]
+    df = df[RAW_ORDER]
+    for c in ("Flow Byts/s", "Flow Pkts/s"):
+        df[c] = df[c].map(lambda v: "Infinity" if v == np.inf else ("-Infinity" if v == -np.inf else v))
+    if duplicate_fwd_header:
+        df.insert(df.columns.get_loc("Bwd Header Len"), "Fwd Header Len (copy)", df["Fwd Header Len"])
+        df.columns = ["Fwd Header Len" if c == "Fwd Header Len (copy)" else c for c in df.columns]
+    if repeated_header_at is not None:
+        text = df.astype(str)
+        header = pd.DataFrame([list(df.columns)], columns=df.columns)
+        df = pd.concat([text.iloc[:repeated_header_at], header, text.iloc[repeated_header_at:]], ignore_index=True)
+    if pad_headers:
+        df.columns = [f" {c} " for c in df.columns]
+    df.to_csv(path, index=False)
+    if corrupt_pos is not None:
+        lines = path.read_text().splitlines()
+        line = lines[corrupt_pos + 1].split(",", 1)[1]          # Flow ID field lost
+        assert line.startswith("192.168.15")
+        lines[corrupt_pos + 1] = line[len("192.168.15"):]       # ... and the start of the Src IP
+        path.write_text("\n".join(lines) + "\n")
 
 
-def build_dataset(base: Path) -> dict:
-    ref, idx = make_reference()
+def build_full_dataset(base: Path) -> dict:
+    rng = np.random.default_rng(20261110)
+    ref, idx = build_reference(rng)
     (base / "CSV").mkdir(parents=True)
     quoted = ref.copy()
     quoted.columns = [f"'{c}'" for c in quoted.columns]
     quoted.to_csv(base / "MSCAD.csv", index=False)
 
-    expected = {}
-    normal_pool = iter(idx["Normal"][10:])
+    B, N, H = idx["Brute_Force"], idx["Normal"], idx["HTTP_DDoS"]
+    feats = lambda rows: ref.loc[rows, FEAT].reset_index(drop=True)  # noqa: E731
 
-    def take_normal(k):
-        return [next(normal_pool) for _ in range(k)]
+    write_capture(base / "CSV" / "N-0.pcap_Flow.csv", feats(N[200:221]), rng)
+    # App-01: 638 HTTP_DDoS flows (5 of them share all features with Normal reference rows) plus 3 flows
+    # whose features exist in the reference ONLY as Normal. The capture rule must keep all 641 as HTTP_DDoS.
+    app01 = pd.concat([feats(H[:638]), feats(N[300:303])], ignore_index=True)
+    app01.loc[7, "Flow Byts/s"] = np.inf
+    write_capture(base / "CSV" / "App-01.pcap_Flow.csv", app01, rng)
+    app02 = feats(idx["ICMP_Flood"])
+    app02.loc[0, "Flow Pkts/s"] = -np.inf
+    write_capture(base / "CSV" / "App-02.pcap_Flow.csv", app02, rng, pad_headers=True)
+    write_capture(base / "CSV" / "Scan-1.pcap_Flow.csv", feats(idx["Port_Scan"]), rng, repeated_header_at=5000)
+    # W-B-01: 26 Web_Crwling flows with AM/PM timestamps; data row 1 is an mDNS flow from 192.168.159.131 whose
+    # line loses its Flow ID and the start of its Src IP ("9.131,5353,224.0.0.251,..."), like the real file.
+    w01_meta = random_meta(rng, 26)
+    w01_meta["Timestamp"] = (pd.Timestamp("2020-01-02 00:48:34") + pd.to_timedelta(np.arange(26) * 3, unit="s")
+                             ).strftime(TS_FORMAT_AMPM)
+    w01_meta.loc[1, ["Src IP", "Src Port", "Dst IP", "Dst Port", "Protocol"]] = \
+        ["192.168.159.131", "5353", "224.0.0.251", "5353", "17"]
+    write_capture(base / "CSV" / "W-B-01.pcap_Flow.csv", feats(idx["Web_Crwling"][:26]), rng, w01_meta, corrupt_row=1)
 
-    plan = {
-        "App-01.pcap_Flow.csv": ("HTTP_DDoS", idx["HTTP_DDoS"]),
-        "App-02.pcap_Flow.csv": ("ICMP_Flood", idx["ICMP_Flood"]),
-        "Scan-1.pcap_Flow.csv": ("Port_Scan", idx["Port_Scan"][:2000]),
-        "W-B-01.pcap_Flow.csv": ("Web_Crwling", idx["Web_Crwling"]),
-        "W-B-02.pcap_Flow.csv": ("Brute_Force", idx["Brute_Force"][5:3005]),
-    }
-    for fname, (attack, attack_rows) in plan.items():
-        parts = [
-            raw_rows(ref, attack_rows, external_ip, victim_ip),          # confirmed attack
-            raw_rows(ref, take_normal(30), external_ip, external_ip),    # confirmed Normal
-            raw_rows(ref, take_normal(4), victim_ip, external_ip),       # confirmed Normal, IP rule disagrees
-            unmatched_rows(20, external_ip, victim_ip),                  # fallback -> attack
-            unmatched_rows(10, external_ip, external_ip),                # fallback -> Normal
-        ]
-        sig_attack, sig_normal, fb_attack, fb_normal = len(attack_rows), 34, 20, 10
-        ambiguous = rejected = 0
-        if fname == "W-B-02.pcap_Flow.csv":   # signatures shared by Brute_Force and Normal
-            parts.append(raw_rows(ref, idx["Brute_Force"][:2], external_ip, victim_ip))
-            ambiguous, fb_attack = 2, fb_attack + 2
-        if fname == "App-01.pcap_Flow.csv":   # Port_Scan signature is prohibited here
-            parts.append(raw_rows(ref, idx["Port_Scan"][500:501], external_ip, victim_ip))
-            rejected, fb_attack = 1, fb_attack + 1
-        df = pd.concat(parts, ignore_index=True)
-        df.loc[:2, "Flow Byts/s"] = np.inf
-        df.loc[3, "Flow Pkts/s"] = -np.inf
-        df.loc[4, "Flow Byts/s"] = np.nan
-        df = finish_raw(df)
-        expected[fname] = dict(sig_attack=sig_attack, sig_normal=sig_normal, fb_attack=fb_attack,
-                               fb_normal=fb_normal, ambiguous=ambiguous, rejected=rejected, rows=len(df))
-
-        text = df.astype(object).where(df.notna(), "")
-        text = text.astype(str).replace({"inf": "Infinity", "-inf": "-Infinity"})
-        if fname == "Scan-1.pcap_Flow.csv":
-            text.loc[7, "Timestamp"] = "not-a-time"
-            header_line = pd.DataFrame([RAW_ORDER], columns=RAW_ORDER)
-            text = pd.concat([text.iloc[:50], header_line, text.iloc[50:]], ignore_index=True)
-            expected[fname]["dropped"] = 1
-        if fname == "W-B-02.pcap_Flow.csv":
-            text.insert(text.columns.get_loc("Bwd Header Len"), "Fwd Header Len.1", text["Fwd Header Len"])
-            text.columns = [c if c != "Fwd Header Len.1" else "Fwd Header Len" for c in text.columns]
-        if fname == "App-02.pcap_Flow.csv":
-            text.columns = [f" {c} " for c in text.columns]
-        text.to_csv(base / "CSV" / fname, index=False)
-
-    normal = raw_rows(ref, take_normal(40), external_ip, external_ip)
-    other = unmatched_rows(15, victim_ip, external_ip)
-    df = pd.concat([normal, other], ignore_index=True)
-    df = finish_raw(df)
-    df.astype(str).to_csv(base / "CSV" / "N-0.pcap_Flow.csv", index=False)
-    expected["N-0.pcap_Flow.csv"] = dict(sig_normal=40, baseline=15, rows=len(df))
-    return expected
+    # W-B-02 mirrors the real capture: 88,501 Brute_Force reference flows (B[40] is not reproduced), 8 extra
+    # copies of reference flows (B[50:58]) and 17 attack-session fragments that are not in the reference.
+    # Infinity in 3 flows forces the 12-feature level for them. Two verified flows are LLMNR background traffic
+    # that the reference labels Brute_Force.
+    verified = feats(np.delete(B, 40))
+    verified.loc[30:32, "Flow Byts/s"] = np.inf
+    copies = feats(B[50:58])
+    fragments = feats(B[60:77])
+    fragments["Tot Fwd Pkts"] = 10.0**13 + np.arange(17)       # signatures absent from the reference
+    wb02 = pd.concat([verified, copies, fragments], ignore_index=True)
+    n02 = len(wb02)
+    start = pd.Timestamp("2020-01-02 01:45:02")
+    secs = rng.integers(0, 183, n02)
+    secs[0], secs[1] = 0, 182                                   # verified window 01:45:02 .. 01:48:04
+    secs[-17:] = rng.integers(3, 7, 17)                         # fragments inside the window
+    wb02_meta = pd.DataFrame({**{k: [v] * n02 for k, v in ATTACK_SESSION.items()},
+                              "Src Port": rng.integers(1024, 65535, n02).astype(str),
+                              "Timestamp": (start + pd.to_timedelta(secs, unit="s")).strftime(TS_FORMAT_AMPM)})
+    wb02_meta.loc[100:101, ["Src IP", "Dst IP", "Dst Port", "Protocol"]] = ["192.168.159.131", "224.0.0.252", "5355", "17"]
+    write_capture(base / "CSV" / "W-B-02.pcap_Flow.csv", wb02, rng, wb02_meta, duplicate_fwd_header=True)
+    return {"ref": ref, "idx": idx, "w01_repaired_features": ref.loc[idx["Web_Crwling"][1], FEAT]}
 
 
-def run_pipeline(base: Path, *extra) -> int:
-    pm.LOG.handlers.clear()
-    return pm.main(["--base-dir", str(base), *extra])
+_DATA: dict = {}
 
 
-def test_end_to_end():
-    base = Path(tempfile.mkdtemp(prefix="mscad_synth_"))
+def dataset() -> dict:
+    """Build the full-scale dataset and run the pipeline once per test session."""
+    if not _DATA:
+        base = Path(tempfile.mkdtemp(prefix="mscad_full_"))
+        atexit.register(shutil.rmtree, base, True)
+        info = build_full_dataset(base)
+        inputs_before = {p.name: sha256(p) for p in (base / "CSV").glob("*.csv")}
+        ref_before = sha256(base / "MSCAD.csv")
+        rc = run_pipeline("--base-dir", base)
+        _DATA.update(info, base=base, out=base / "CSV_73Cols", rc=rc,
+                     inputs_before=inputs_before, ref_before=ref_before)
+    return _DATA
+
+
+_OUTPUTS: dict = {}
+
+
+def outputs() -> dict:
+    if not _OUTPUTS:
+        out = dataset()["out"]
+        for fname in EXPECTED_DISTRIBUTION:
+            _OUTPUTS[fname] = read_output(out / fname)
+    return _OUTPUTS
+
+
+def report(name: str) -> pd.DataFrame:
+    return pd.read_csv(dataset()["out"] / name)
+
+
+# =============================================================================
+# A. Input files
+# =============================================================================
+
+
+def test_module_configuration_matches_verified_ground_truth():
+    assert set(pm.INPUT_FILES) == set(EXPECTED_DISTRIBUTION)
+    assert pm.EXPECTED_CAPTURE_DISTRIBUTION == EXPECTED_DISTRIBUTION
+    assert pm.EXPECTED_RAW_TOTAL == 100_340 == sum(EXPECTED_ROWS.values())
+    assert pm.EXPECTED_CLASS_COUNTS == KAGGLE_COUNTS and sum(KAGGLE_COUNTS.values()) == 128_799
+    assert set(pm.SINGLE_CLASS_CAPTURES) | set(pm.MIXED_CLASS_CAPTURES) == set(EXPECTED_DISTRIBUTION)
+    assert set(pm.MIXED_CLASS_CAPTURES) == {"W-B-02.pcap_Flow.csv"}
+
+
+def test_all_six_inputs_recognised_and_processed():
+    data = dataset()
+    assert data["rc"] == 0, "pipeline exit code"
+    summary = report("processing_summary.csv")
+    assert sorted(summary["Filename"]) == sorted(EXPECTED_DISTRIBUTION)
+    assert (summary["Status"] == "OK").all(), summary[["Filename", "Status", "Error"]].to_string()
+
+
+def test_missing_input_file_fails_clearly():
+    data = dataset()
+    tmp = Path(tempfile.mkdtemp(prefix="mscad_missing_"))
     try:
-        expected = build_dataset(base)
-        before = {p.name: pm.sha256_of(p) for p in (base / "CSV").glob("*.csv")}
-        ref_hash = pm.sha256_of(base / "MSCAD.csv")
-
-        assert run_pipeline(base) == 0
-        out_dir = base / "CSV_73Cols"
-        outputs = sorted(p.name for p in out_dir.glob("*.csv") if p.name in pm.INPUT_FILES)
-        assert outputs == sorted(pm.INPUT_FILES)
-
-        summary = pd.read_csv(out_dir / "processing_summary.csv").set_index("Filename")
-        for fname, exp in expected.items():
-            out = pd.read_csv(out_dir / fname, dtype=str, keep_default_na=False)
-            assert list(out.columns) == pm.FINAL_COLUMNS and out.shape[1] == 73
-            row = summary.loc[fname]
-            prov = pd.read_csv(out_dir / "_provenance" / fname.replace(".csv", ".provenance.csv"))
-            if fname == "N-0.pcap_Flow.csv":
-                assert set(out["Label"]) == {"Normal"}
-                assert row["Signature Matches"] == exp["sig_normal"]
-                assert row["Baseline-Rule Rows"] == exp["baseline"]
-                continue
-            attack = pm.INPUT_FILES[fname]
-            assert row["Signature Matches"] == exp["sig_attack"] + exp["sig_normal"], fname
-            assert row["Ambiguous Matches"] == exp["ambiguous"], fname
-            assert row["Constraint-Rejected Matches"] == exp["rejected"], fname
-            assert row["Fallback Attack Rows"] == exp["fb_attack"], fname
-            assert row["Fallback Normal Rows"] == exp["fb_normal"], fname
-            assert row["Attack Rows"] == exp["sig_attack"] + exp["fb_attack"], fname
-            assert row["Normal Rows"] == exp["sig_normal"] + exp["fb_normal"], fname
-            assert row["Attack Rows (Kaggle signature)"] == exp["sig_attack"], fname
-            assert row["Output Rows"] == exp["rows"], fname
-            assert row["Invalid Numeric Values"] == 5, fname  # 3 Infinity + 1 -Infinity + 1 NaN
-            # Signature labels are never overwritten by the IP rule.
-            disagree = prov[(prov.Label_Source == "kaggle_signature") & (prov.IP_Rule_Label != prov.Label)]
-            assert len(disagree) == 4 and set(disagree.Label) == {"Normal"}, fname
-            assert set(out["Label"]) == {attack, "Normal"}
-            assert (pd.to_numeric(out["Flow Byts/s"]) >= 0).all()
-
-        scan = summary.loc["Scan-1.pcap_Flow.csv"]
-        assert scan["Dropped Rows"] == 1 and scan["Invalid Timestamps"] == 1
-        scan_out = pd.read_csv(out_dir / "Scan-1.pcap_Flow.csv", dtype=str, keep_default_na=False)
-        assert scan_out["Timestamp"].iloc[-1] == "not-a-time"
-        assert "verified identical" in summary.loc["W-B-02.pcap_Flow.csv", "Duplicate Column Handling"]
-
-        checks = pd.read_csv(out_dir / "validation_checks.csv")
-        fails = checks[checks.Status == "FAIL"]
-        assert fails.empty, fails.to_string()
-        warns = checks[checks.Status == "WARN"]
-        assert list(warns.File) == ["Scan-1.pcap_Flow.csv"]  # the deliberately invalid timestamp
-
-        after = {p.name: pm.sha256_of(p) for p in (base / "CSV").glob("*.csv")}
-        assert before == after and ref_hash == pm.sha256_of(base / "MSCAD.csv")
-
-        agg = pd.read_csv(out_dir / "aggregated_class_verification.csv").set_index("Class")
-        assert agg.loc["HTTP_DDoS", "From Kaggle Signature"] == 641
-        assert agg.loc["HTTP_DDoS", "Kaggle Rows Recovered By Signature"] == 641
+        (tmp / "CSV").mkdir()
+        for p in (data["base"] / "CSV").glob("*.csv"):
+            if p.name != "App-02.pcap_Flow.csv":
+                shutil.copy(p, tmp / "CSV" / p.name)
+        capture = _Capture()
+        rc = run_pipeline("--base-dir", tmp, "--reference", data["base"] / "MSCAD.csv", capture=capture)
+        assert rc == 2
+        assert any("Missing input files" in m and "App-02.pcap_Flow.csv" in m for m in capture.messages)
+        assert not (tmp / "CSV_73Cols").exists(), "nothing may be written when an input is missing"
     finally:
-        shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_missing_reference_stops_before_writing():
-    base = Path(tempfile.mkdtemp(prefix="mscad_noref_"))
+def test_inputs_not_merged_or_skipped():
+    out = dataset()["out"]
+    csvs = sorted(p.name for p in out.glob("*.csv"))
+    assert sorted(set(csvs) - set(pm.REPORT_CSV_FILES)) == sorted(EXPECTED_DISTRIBUTION)
+    for fname in EXPECTED_DISTRIBUTION:
+        prov = pd.read_csv(out / "_provenance" / fname.replace(".csv", ".provenance.csv"))
+        raw_rows = len(pd.read_csv(dataset()["base"] / "CSV" / fname, usecols=[0]))
+        dropped = 1 if fname == "Scan-1.pcap_Flow.csv" else 0
+        assert prov["input_row"].is_unique and len(prov) == raw_rows - dropped == EXPECTED_ROWS[fname], fname
+        assert prov["input_row"].max() < raw_rows, f"{fname}: row from another file"
+
+
+# =============================================================================
+# B/C. Row counts and label distributions
+# =============================================================================
+
+
+def test_exact_row_counts():
+    for fname, df in outputs().items():
+        assert len(df) == EXPECTED_ROWS[fname], f"{fname}: {len(df)} rows"
+    assert sum(len(df) for df in outputs().values()) == 100_340
+
+
+def test_exact_label_distributions():
+    for fname, df in outputs().items():
+        actual = {k: int(v) for k, v in df["Label"].value_counts().items()}
+        assert actual == EXPECTED_DISTRIBUTION[fname], f"{fname}: {actual}"
+
+
+def test_app01_never_labels_normal_despite_signature_collisions():
+    df = outputs()["App-01.pcap_Flow.csv"]
+    assert (df["Label"] == "HTTP_DDoS").all() and len(df) == 641
+    summary = report("processing_summary.csv").set_index("Filename")
+    # The 3 flows whose features exist in the reference only as Normal are collisions, overridden.
+    assert summary.loc["App-01.pcap_Flow.csv", "Signature Collisions Overridden By Capture Rule"] == 3
+    prov = pd.read_csv(dataset()["out"] / "_provenance" / "App-01.pcap_Flow.provenance.csv")
+    assert set(prov["Label_Source"]) == {"capture_rule"}
+    assert prov["Signature_Collision"].sum() == 3
+    assert (prov.loc[prov["Signature_Collision"], "Label"] == "HTTP_DDoS").all()
+    assert (prov["Match_Status"] == "ambiguous").sum() == 5  # HTTP_DDoS/Normal shared vectors
+
+
+def test_single_class_captures_use_capture_rule_only():
+    out = dataset()["out"]
+    for fname, cls in pm.SINGLE_CLASS_CAPTURES.items():
+        prov = pd.read_csv(out / "_provenance" / fname.replace(".csv", ".provenance.csv"))
+        assert set(prov["Label_Source"]) == {"capture_rule"} and set(prov["Label"]) == {cls}, fname
+
+
+# =============================================================================
+# D. Mixed-class (W-B-02) matching
+# =============================================================================
+
+
+def _rows(values) -> pd.DataFrame:
+    """Each value is (signature_value, other_value): the 12 signature features get the first value and
+    the other 54 features the second (NaN = invalid value, e.g. Infinity)."""
+    return pd.DataFrame([{c: float(s) if c in SIG else float(o) for c in FEAT} for s, o in values], columns=FEAT)
+
+
+def _small_lookups():
+    ref_rows = [
+        (1, 10, "Brute_Force"), (1, 11, "Normal"),            # signature shared, full vectors differ
+        (2, 20, "Brute_Force"), (2, 20, "Brute_Force"),       # duplicate reference rows, one label
+        (3, 30, "Brute_Force"), (3, 30, "Normal"),            # conflicting labels on the full vector
+        (4, 40, "Port_Scan"),                                 # only a label not permitted in W-B-02
+        (5, 50, "Brute_Force"), (5, 50, "Port_Scan"),         # cross-capture collision
+        (6, 60, "Normal"),
+    ]
+    ref = _rows([(s, o) for s, o, _ in ref_rows])
+    labels = pd.Series([lab for _, _, lab in ref_rows])
+    sig, _ = pm.prepare_signature_lookup(ref, labels)
+    full, _ = pm.prepare_signature_lookup(ref, labels, columns=FEAT)
+    return sig, full
+
+
+def _levels(sig, full):
+    return [(pm.SOURCE_KAGGLE_FULL, FEAT, full), (pm.SOURCE_KAGGLE_SIG, SIG, sig)]
+
+
+def test_mixed_matching_edge_cases():
+    sig, full = _small_lookups()
+    flows = _rows([(1, 10), (1, 11), (1, np.nan), (2, 20), (2, 20), (2, 20), (3, 30), (4, 40), (5, 50),
+                   (6, np.nan), (9, 90)])
+    res, stats = pm.resolve_mixed_capture_labels(flows, _levels(sig, full), {"Brute_Force", "Normal"})
+    expected = [
+        ("verified", "Brute_Force", pm.SOURCE_KAGGLE_FULL),   # exact 66-feature match
+        ("verified", "Normal", pm.SOURCE_KAGGLE_FULL),        # same signature, other full vector
+        ("ambiguous", None, pm.SOURCE_KAGGLE_SIG),            # invalid feature -> signature level -> BF/Normal
+        ("verified", "Brute_Force", pm.SOURCE_KAGGLE_FULL),   # duplicates in reference
+        ("verified", "Brute_Force", pm.SOURCE_KAGGLE_FULL),
+        ("verified", "Brute_Force", pm.SOURCE_KAGGLE_FULL),
+        ("ambiguous", None, pm.SOURCE_KAGGLE_FULL),           # conflicting labels: never guessed
+        ("prohibited_only", None, pm.SOURCE_KAGGLE_FULL),
+        ("verified", "Brute_Force", pm.SOURCE_KAGGLE_FULL),   # Port_Scan label belongs to Scan-1
+        ("verified", "Normal", pm.SOURCE_KAGGLE_SIG),         # invalid feature -> signature level
+        ("unmatched", None, ""),
+    ]
+    got = list(zip(res["Mixed_Status"], res["Mixed_Label"], res["Evidence_Level"]))
+    assert got == expected, got
+    assert res["Cross_Capture_Collision"].tolist() == [False] * 8 + [True, False, False]
+    # 3 capture rows share a key that has only 2 reference rows.
+    assert res["Exceeds_Reference_Multiplicity"].tolist()[3:6] == [True, True, True]
+    assert stats["ambiguous"] == 2 and stats["prohibited_only"] == 1 and stats["unmatched"] == 1
+    assert stats["verified_by_label"] == {"Brute_Force": 5, "Normal": 2}
+    assert stats["extra_copies_by_label"] == {"Brute_Force": 1, "Normal": 0}  # 3 capture rows, 2 reference rows
+
+
+def test_mixed_matching_is_deterministic():
+    sig, full = _small_lookups()
+    flows = _rows([(1, 10), (2, 20), (3, 30), (6, np.nan), (9, 90), (5, 50)])
+    first, _ = pm.resolve_mixed_capture_labels(flows, _levels(sig, full), {"Brute_Force", "Normal"})
+    second, _ = pm.resolve_mixed_capture_labels(flows.iloc[::-1].reset_index(drop=True), _levels(sig, full),
+                                                {"Brute_Force", "Normal"})
+    assert first.equals(pm.resolve_mixed_capture_labels(flows, _levels(sig, full), {"Brute_Force", "Normal"})[0])
+    assert first.iloc[::-1].reset_index(drop=True)[["Mixed_Status", "Mixed_Label"]].equals(
+        second[["Mixed_Status", "Mixed_Label"]])
+
+
+def test_unresolved_rows_raise_instead_of_guessing():
+    sig, full = _small_lookups()
+    flows = _rows([(1, 10), (3, 30), (9, 90)])
     try:
-        (base / "CSV").mkdir()
-        for f in pm.INPUT_FILES:
-            (base / "CSV" / f).write_text("Src IP\n1.1.1.1\n")
-        assert run_pipeline(base) == 3
-        assert not (base / "CSV_73Cols").exists()
+        pm.assign_capture_labels("W-B-02.pcap_Flow.csv", flows, sig, full)
+    except pm.UnresolvedLabelsError as exc:
+        assert list(exc.rows.index) == [1, 2]
+        assert list(exc.rows["Mixed_Status"]) == ["ambiguous", "unmatched"]
+    else:
+        raise AssertionError("ambiguous/unmatched W-B-02 rows must not be labelled")
+    labels, prov, stats = pm.assign_capture_labels("W-B-02.pcap_Flow.csv", _rows([(1, 10), (6, 60)]), sig, full)
+    assert list(labels) == ["Brute_Force", "Normal"] and stats["mode"] == "mixed_class"
+    assert list(prov["Label_Source"]) == [pm.SOURCE_KAGGLE_FULL] * 2
+
+
+def test_capture_rule_overrides_signature_matching():
+    sig, full = _small_lookups()
+    flows = _rows([(6, 60), (3, 30), (9, 90), (1, 11)])  # Normal-only, conflicting, unmatched, Normal
+    labels, prov, stats = pm.assign_capture_labels("App-01.pcap_Flow.csv", flows, sig, full)
+    assert list(labels) == ["HTTP_DDoS"] * 4
+    assert stats["signature_collisions_overridden"] == 3 and stats["signature_rows_not_in_reference"] == 1
+
+
+def test_wb02_all_brute_force_with_evidence_levels():
+    df = outputs()["W-B-02.pcap_Flow.csv"]
+    assert (df["Label"] == "Brute_Force").sum() == 88_526 and set(df["Label"]) == {"Brute_Force"}
+    prov = pd.read_csv(dataset()["out"] / "_provenance" / "W-B-02.pcap_Flow.provenance.csv")
+    sources = prov.groupby(["Label_Source", "Label"]).size().to_dict()
+    assert sources == {(pm.SOURCE_KAGGLE_FULL, "Brute_Force"): 88_506, (pm.SOURCE_KAGGLE_SIG, "Brute_Force"): 3,
+                       (pm.SOURCE_SESSION_RULE, "Brute_Force"): 17}
+    assert set(prov["Match_Status"]) == {"verified"}
+    assert prov["Signature_Collision"].sum() == 1  # the flow identical to a Port_Scan reference row
+    summary = report("processing_summary.csv").set_index("Filename")
+    assert summary.loc["W-B-02.pcap_Flow.csv", "Extra Copies Of Reference Flows"] == 8
+    assert summary.loc["W-B-02.pcap_Flow.csv", "Verified By Attack-Session Rule"] == 17
+    assert not (dataset()["out"] / "_diagnostics" / "W-B-02.pcap_Flow.unresolved_rows.csv").exists()
+
+
+def test_unresolved_wb02_stops_capture_and_reports_rows():
+    data = dataset()
+    ref, idx = data["ref"], data["idx"]
+    tmp = Path(tempfile.mkdtemp(prefix="mscad_unresolved_"))
+    try:
+        (tmp / "CSV").mkdir()
+        for p in (data["base"] / "CSV").glob("*.csv"):
+            if p.name != "W-B-02.pcap_Flow.csv":
+                shutil.copy(p, tmp / "CSV" / p.name)
+        rng = np.random.default_rng(5)
+        part = ref.loc[idx["Brute_Force"][100:105], FEAT].reset_index(drop=True)
+        extra = ref.loc[idx["Brute_Force"][[0, 50]], FEAT].reset_index(drop=True)
+        extra.loc[0, "Flow Byts/s"] = np.inf        # forces the signature level, shared by BF and Normal
+        extra.loc[1, SIG] = 7.0e13                  # signature not in the reference ...
+        extra.loc[1, "Flow IAT Mean"] = 123.25
+        frame = pd.concat([part, extra], ignore_index=True)
+        meta = pd.DataFrame({**{k: [v] * 7 for k, v in ATTACK_SESSION.items()}, "Src Port": "40000",
+                             "Timestamp": ["02/01/2020 01:45:0%d AM" % i for i in range(7)]})
+        meta.loc[6, "Dst Port"] = "22"              # ... and not part of a verified attack session
+        write_capture(tmp / "CSV" / "W-B-02.pcap_Flow.csv", frame, rng, meta)
+        rc = run_pipeline("--base-dir", tmp, "--reference", data["base"] / "MSCAD.csv")
+        out = tmp / "CSV_73Cols"
+        assert rc == 1
+        assert not (out / "W-B-02.pcap_Flow.csv").exists(), "no W-B-02 output may be written"
+        unresolved = pd.read_csv(out / "_diagnostics" / "W-B-02.pcap_Flow.unresolved_rows.csv")
+        assert sorted(unresolved["Mixed_Status"]) == ["ambiguous", "unmatched"]
+        assert {"input_row", "input_csv_line", "Src IP", "Timestamp", "Session_Rule_Reason"} <= set(unresolved.columns)
+        reason = unresolved.loc[unresolved["Mixed_Status"] == "unmatched", "Session_Rule_Reason"].item()
+        assert "no verified attack flow" in reason
+        checks = pd.read_csv(out / "validation_checks.csv")
+        failed = checks[checks["Status"] == "FAIL"]
+        assert ((failed["File"] == "W-B-02.pcap_Flow.csv") & (failed["Check"] == "file processed")).any()
+        assert (pd.read_csv(out / "processing_summary.csv").set_index("Filename")
+                .drop(index="W-B-02.pcap_Flow.csv")["Status"] == "OK").all()
     finally:
-        shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_differing_duplicate_column_is_not_discarded():
-    df = pd.DataFrame([[1, 2, 3], [4, 5, 7]], columns=["Fwd Header Len", "Bwd Header Len", "Fwd Header Len.1"])
+def test_attack_session_rule():
+    sig, full = _small_lookups()
+    flows = _rows([(1, 10), (2, 20), (9, 90), (9, 91), (9, 92), (9, 93), (3, 30)])
+    meta = pd.DataFrame({
+        "Src IP": ["192.168.159.1"] * 7, "Src Port": "1",
+        "Dst IP": ["192.168.159.131"] * 7, "Dst Port": ["80", "80", "80", "80", "22", "80", "80"], "Protocol": "6",
+        "Timestamp": ["02/01/2020 01:45:02 AM", "02/01/2020 01:45:09 AM",   # verified Brute_Force window
+                      "02/01/2020 01:45:05 AM",                             # inside, same key -> Brute_Force
+                      "02/01/2020 01:45:10 AM",                             # outside the window
+                      "02/01/2020 01:45:05 AM",                             # other Dst Port
+                      "garbage",                                            # unparseable timestamp
+                      "02/01/2020 01:45:05 AM"],                            # ambiguous: never touched
+    })
     try:
-        pm.resolve_duplicate_columns(df, "unit")
-    except pm.SchemaError:
+        pm.assign_capture_labels("W-B-02.pcap_Flow.csv", flows, sig, full, meta=meta)
+    except pm.UnresolvedLabelsError as exc:
+        rows = exc.rows
+        assert list(rows.index) == [3, 4, 5, 6]
+        assert list(rows["Mixed_Status"]) == ["unmatched", "unmatched", "unmatched", "ambiguous"]
+        assert "outside the time window" in rows.loc[3, "Session_Rule_Reason"]
+        assert "no verified attack flow" in rows.loc[4, "Session_Rule_Reason"]
+        assert "unparseable timestamp" in rows.loc[5, "Session_Rule_Reason"]
+    else:
+        raise AssertionError("rows outside a verified attack session must stay unresolved")
+    labels, prov, stats = pm.assign_capture_labels("W-B-02.pcap_Flow.csv", flows.iloc[:3], sig, full, meta=meta.iloc[:3])
+    assert list(labels) == ["Brute_Force"] * 3
+    assert list(prov["Label_Source"]) == [pm.SOURCE_KAGGLE_FULL, pm.SOURCE_KAGGLE_FULL, pm.SOURCE_SESSION_RULE]
+    assert stats["session_rule_rows"] == 1 and stats["unmatched"] == 0
+    # Without metadata the rule is not applied and the unmatched row stays unresolved.
+    try:
+        pm.assign_capture_labels("W-B-02.pcap_Flow.csv", flows.iloc[:3], sig, full)
+    except pm.UnresolvedLabelsError:
         pass
     else:
-        raise AssertionError("differing duplicate column was silently dropped")
-    same = pd.DataFrame([[1, 2, 1.0], [4, 5, 4.0]], columns=["Fwd Header Len", "Bwd Header Len", "Fwd Header Len.1"])
-    out, notes = pm.resolve_duplicate_columns(same, "unit")
-    assert list(out.columns) == ["Fwd Header Len", "Bwd Header Len"] and notes
+        raise AssertionError("session rule needs metadata")
 
 
-def test_ambiguous_signature_never_labelled():
-    ref = pd.DataFrame({c: [1.0, 1.0, 2.0] for c in pm.SIGNATURE_COLUMNS})
-    lookup, stats = pm.prepare_signature_lookup(ref, pd.Series(["Normal", "Brute_Force", "Port_Scan"]))
-    assert stats["ambiguous_signatures"] == 1
-    flows = pd.DataFrame({c: [1.0, 2.0, 3.0, np.nan] for c in pm.SIGNATURE_COLUMNS})
-    res, mstats = pm.match_ground_truth_labels(flows, lookup, {"Brute_Force", "Normal"})
-    assert list(res.Signature_Status) == ["ambiguous", "constraint_rejected", "unmatched", "incomplete_signature"]
-    assert res.Signature_Label.isna().all()
-    assert mstats["unique_valid_matches"] == 0
+def test_repeated_runs_give_identical_outputs():
+    data = dataset()
+    tmp = Path(tempfile.mkdtemp(prefix="mscad_rerun_"))
+    try:
+        rc = run_pipeline("--base-dir", data["base"], "--output-dir", tmp / "out")
+        assert rc == 0
+        for fname in EXPECTED_DISTRIBUTION:
+            assert sha256(tmp / "out" / fname) == sha256(data["out"] / fname), fname
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# =============================================================================
+# E. Schema
+# =============================================================================
+
+
+def test_output_schema_exact():
+    ref_header = [c.strip().strip("'").strip() for c in pd.read_csv(dataset()["base"] / "MSCAD.csv", nrows=0).columns]
+    kaggle_features = [c for c in ref_header if c != "Label"]
+    assert len(kaggle_features) == 66 and kaggle_features[0] == "Flow Duration" and kaggle_features[-1] == "Idle Min"
+    expected = METADATA + kaggle_features + ["Label"]
+    for fname, df in outputs().items():
+        cols = list(df.columns)
+        assert len(cols) == 73 and cols == expected, fname
+        assert len(set(cols)) == 73, f"{fname}: duplicate column names"
+        assert cols[:6] == METADATA and cols[6:72] == kaggle_features and cols[72] == "Label"
+        assert not [c for c in cols if c.startswith("__") or c in ("input_row", "Flow ID")], fname
+
+
+def test_reference_with_different_feature_order_is_rejected():
+    n = sum(KAGGLE_COUNTS.values())
+    order = FEAT.copy()
+    order[1], order[2] = order[2], order[1]
+    ref = pd.DataFrame(np.zeros((n, 66)), columns=order)
+    ref["Label"] = np.concatenate([[lab] * c for lab, c in KAGGLE_COUNTS.items()])
+    try:
+        pm.validate_reference_dataset(ref, Path("synthetic.csv"))
+    except pm.ReferenceDatasetError as exc:
+        assert "feature order" in str(exc)
+    else:
+        raise AssertionError("a reordered reference must be rejected")
+
+
+# =============================================================================
+# F. Chronological sorting
+# =============================================================================
+
+
+def test_outputs_sorted_chronologically():
+    for fname, df in outputs().items():
+        parsed, stats = pm.parse_timestamps(df["Timestamp"])
+        assert stats["invalid_timestamps"] == 0 and parsed.is_monotonic_increasing, fname
+        pattern = r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}( [AP]M)?$"
+        assert df["Timestamp"].str.match(pattern).all(), f"{fname}: format changed"
+    assert outputs()["W-B-02.pcap_Flow.csv"]["Timestamp"].str.endswith(("AM", "PM")).all()  # kept as written
+    lex = outputs()["Scan-1.pcap_Flow.csv"]["Timestamp"]
+    assert not lex.is_monotonic_increasing, "sorted lexicographically instead of chronologically"
+
+
+def test_day_first_parsing_and_invalid_timestamp_policy():
+    df = pd.DataFrame({"Timestamp": ["01/02/2021 00:00:00", "bad", "02/01/2021 00:00:00", "01/01/2021 12:00:00"],
+                       "x": [1, 2, 3, 4]})
+    out, stats = pm.sort_flows_chronologically(df)
+    assert list(out["x"]) == [4, 3, 1, 2]  # 1 Jan 12:00, 2 Jan, 1 Feb, invalid last
+    assert stats["invalid_timestamps"] == 1
+    assert list(out["Timestamp"])[0] == "01/01/2021 12:00:00"
+
+
+def test_sorting_is_per_file():
+    out = dataset()["out"]
+    for fname in EXPECTED_DISTRIBUTION:
+        prov = pd.read_csv(out / "_provenance" / fname.replace(".csv", ".provenance.csv"), dtype={"Timestamp": str})
+        assert (prov["Timestamp"].to_numpy() == outputs()[fname]["Timestamp"].to_numpy()).all()
+
+
+# =============================================================================
+# G. Validation and coverage report
+# =============================================================================
+
+
+def test_coverage_reconciliation_totals():
+    cov = report("aggregated_class_verification.csv").set_index("Class")
+    total = cov.loc["TOTAL"]
+    assert total["Kaggle Rows"] == 128_799 and total["PCAP Output Rows"] == 100_340
+    assert total["Difference (Kaggle - PCAP)"] == 28_459
+    assert cov.loc["Normal", "Difference (Kaggle - PCAP)"] == 28_481
+    assert cov.loc["Web_Crwling", "Difference (Kaggle - PCAP)"] == 2
+    assert cov.loc["Brute_Force", "Difference (Kaggle - PCAP)"] == -24
+    for lab in ("Normal", "Web_Crwling", "Brute_Force"):
+        assert cov.loc[lab, "Category"] == "EXPECTED_VARIATION", lab
+    for lab in ("Port_Scan", "HTTP_DDoS", "ICMP_Flood"):
+        assert cov.loc[lab, "Difference (Kaggle - PCAP)"] == 0 and cov.loc[lab, "Category"] == "EXACT_MATCH"
+
+
+def test_no_double_counting():
+    cov = report("aggregated_class_verification.csv").set_index("Class")
+    per_class = cov.drop(index="TOTAL")["Difference (Kaggle - PCAP)"]
+    assert per_class.sum() == cov.loc["TOTAL", "Difference (Kaggle - PCAP)"] == 28_459
+    assert cov.loc["Normal", "Difference (Kaggle - PCAP)"] != 28_459
+    assert "Normal 28,481 + Web_Crwling 2 - Brute_Force 24" in cov.loc["TOTAL", "Explanation"]
+
+
+def test_coverage_explanation_documented():
+    cov = report("aggregated_class_verification.csv").set_index("Class")
+    assert "21-row baseline slice" in cov.loc["Normal", "Explanation"]
+    assert "26 flows" in cov.loc["Web_Crwling", "Explanation"] and "not fabricated" in cov.loc["Web_Crwling", "Explanation"]
+    assert "24 more flows than Kaggle" in cov.loc["Brute_Force", "Explanation"]
+    md = (dataset()["out"] / "processing_report.md").read_text(encoding="utf-8")
+    assert "Capture reconciliation" in md and "28,481" in md and "FAIL 0, WARN 0" in md
+
+
+def test_capture_reconciliation_report():
+    cap = report("capture_reconciliation.csv").set_index("PCAP file")
+    assert cap.loc["W-B-01.pcap_Flow.csv", "Status"] == "Expected variation"
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Status"] == "Reconciled"
+    assert cap.loc["N-0.pcap_Flow.csv", "Status"] == "Expected truncated baseline"
+    for f in ("App-01.pcap_Flow.csv", "App-02.pcap_Flow.csv", "Scan-1.pcap_Flow.csv"):
+        assert cap.loc[f, "Status"] == "Exact match", f
+    assert cap.loc["W-B-01.pcap_Flow.csv", "Difference"] == 2
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Difference"] == 24
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Kaggle - Extracted"] == -24
+    assert cap.loc["N-0.pcap_Flow.csv", "Difference"] == 28_481
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Final labels"] == "88,526 Brute_Force"
+    assert cap.loc["W-B-01.pcap_Flow.csv", "Message"].startswith(
+        "W-B-01: 26 extracted rows assigned Web_Crwling (100%). Kaggle reference contains 28 Web_Crwling rows; "
+        "the 2-row difference is an expected PCAP extraction variation.")
+    assert "1 malformed input line(s) were realigned" in cap.loc["W-B-01.pcap_Flow.csv", "Message"]
+    assert cap.loc["N-0.pcap_Flow.csv", "Message"] == (
+        "N-0: All 21 extracted rows assigned Normal (100%). Kaggle contains 28,502 Normal rows in total; the "
+        "28,481-row difference reflects aggregated background traffic across capture sessions that is not present "
+        "in the distributed 21-row N-0 PCAP slice.")
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Message"] == (
+        "W-B-02: 88,526 extracted rows assigned Brute_Force (100%). Kaggle reference contains 88,502 Brute_Force "
+        "rows; the 24-row difference is an expected PCAP extraction variation: 8 extra copies of reference flows "
+        "+ 17 attack-session fragments not in the reference - 1 reference row(s) not reproduced.")
+    assert cap["Extracted rows"].sum() == 100_340
+
+
+def test_validation_has_no_failures_or_warnings():
+    checks = report("validation_checks.csv")
+    bad = checks[checks["Status"].isin(["FAIL", "WARN"])]
+    assert bad.empty, bad.to_string()
+    assert set(checks["Category"]) >= {"schema", "labels", "flow_count", "timestamps", "integrity", "coverage"}
+    data = dataset()
+    assert {p.name: sha256(p) for p in (data["base"] / "CSV").glob("*.csv")} == data["inputs_before"]
+    assert sha256(data["base"] / "MSCAD.csv") == data["ref_before"]
+
+
+def _results_with(counts_by_file):
+    return [{"filename": f, "status": "OK", "validated_class_counts": {lab: c.get(lab, 0) for lab in KAGGLE_COUNTS}}
+            for f, c in counts_by_file.items()]
+
+
+def test_genuine_errors_are_still_detected():
+    good = {f: dict(d) for f, d in EXPECTED_DISTRIBUTION.items()}
+    table, checks = pm.reconcile_coverage(_results_with(good), KAGGLE_COUNTS)
+    assert all(c["Status"] == "PASS" for c in checks)
+
+    mislabelled = {f: dict(d) for f, d in EXPECTED_DISTRIBUTION.items()}
+    mislabelled["App-01.pcap_Flow.csv"] = {"HTTP_DDoS": 640, "Normal": 1}
+    table, checks = pm.reconcile_coverage(_results_with(mislabelled), KAGGLE_COUNTS)
+    cats = table.set_index("Class")["Category"]
+    assert cats["HTTP_DDoS"] == cats["Normal"] == "LABELLING_OR_FLOW_COUNT_MISMATCH"
+    assert any(c["Status"] == "FAIL" for c in checks)
+
+    missing = {f: dict(d) for f, d in EXPECTED_DISTRIBUTION.items()}
+    missing["Scan-1.pcap_Flow.csv"] = {"Port_Scan": 11_000}
+    table, checks = pm.reconcile_coverage(_results_with(missing), KAGGLE_COUNTS)
+    assert any(c["Check"] == "raw PCAP total equals the verified total" and c["Status"] == "FAIL" for c in checks)
+
+    other_reference = dict(KAGGLE_COUNTS, Web_Crwling=30)
+    table, _ = pm.reconcile_coverage(_results_with(good), other_reference)
+    assert table.set_index("Class").loc["Web_Crwling", "Category"] == "REFERENCE_MISMATCH"
+
+
+def test_capture_reconciliation_detects_errors():
+    good = {f: dict(d) for f, d in EXPECTED_DISTRIBUTION.items()}
+    wb02_stats = {"extra_copies_by_label": {"Brute_Force": 8, "Normal": 0},
+                  "one_to_one_by_label": {"Brute_Force": 88_501, "Normal": 0}, "session_rule_rows": 17}
+
+    def results(dist, stats=wb02_stats):
+        res = _results_with(dist)
+        for r in res:
+            if r["filename"] == "W-B-02.pcap_Flow.csv":
+                r["labelling"] = stats
+        return res
+
+    table, checks = pm.reconcile_captures(results(good), KAGGLE_COUNTS)
+    assert all(c["Status"] == "PASS" for c in checks), checks
+    forced = dict(good, **{"W-B-02.pcap_Flow.csv": {"Brute_Force": 88_502, "Normal": 24}})
+    table, checks = pm.reconcile_captures(results(forced), KAGGLE_COUNTS)
+    assert table.set_index("PCAP file").loc["W-B-02.pcap_Flow.csv", "Status"] == "Labelling mismatch"
+    wrong_breakdown = dict(wb02_stats, session_rule_rows=16)
+    table, checks = pm.reconcile_captures(results(good, wrong_breakdown), KAGGLE_COUNTS)
+    assert table.set_index("PCAP file").loc["W-B-02.pcap_Flow.csv", "Status"] == "Unexpected difference"
+    short_w01 = dict(good, **{"W-B-01.pcap_Flow.csv": {"Web_Crwling": 25}})
+    table, _ = pm.reconcile_captures(results(short_w01), KAGGLE_COUNTS)
+    assert table.set_index("PCAP file").loc["W-B-01.pcap_Flow.csv", "Status"] == "Labelling mismatch"
+
+
+# =============================================================================
+# Malformed input lines
+# =============================================================================
+
+
+def test_wb01_malformed_line_realigned():
+    out = dataset()["out"]
+    df = outputs()["W-B-01.pcap_Flow.csv"]
+    assert len(df) == 26 and set(df["Label"]) == {"Web_Crwling"}
+    row = df[df["Dst IP"] == "224.0.0.251"]
+    assert len(row) == 1
+    row = row.iloc[0]
+    assert (row["Src IP"], row["Src Port"], row["Dst Port"], row["Protocol"]) == ("9.131", "5353", "5353", "17")
+    expected = dataset()["w01_repaired_features"]
+    got = pd.to_numeric(row[FEAT])
+    assert np.allclose(got.to_numpy(dtype=float), expected.to_numpy(dtype=float), rtol=0, atol=0), "features misaligned"
+    repairs = pd.read_csv(out / "input_repairs.csv", dtype={"Src IP as found": str})
+    assert len(repairs) == 1 and repairs.loc[0, "Filename"] == "W-B-01.pcap_Flow.csv"
+    assert repairs.loc[0, "Src IP as found"] == "9.131" and not repairs.loc[0, "Src IP valid"]
+    assert repairs.loc[0, "Fields found"] == 83 and repairs.loc[0, "Header fields"] == 84
+    checks = report("validation_checks.csv")
+    info = checks[(checks["File"] == "W-B-01.pcap_Flow.csv") & (checks["Check"].str.contains("realigned"))]
+    assert len(info) == 1 and info["Status"].item() == "INFO"
+    prov = pd.read_csv(out / "_provenance" / "W-B-01.pcap_Flow.provenance.csv", keep_default_na=False)
+    assert (prov["Input_Repair"] != "").sum() == 1
+
+
+def test_unrepairable_malformed_lines_fail():
+    tmp = Path(tempfile.mkdtemp(prefix="mscad_malformed_"))
+    try:
+        rng = np.random.default_rng(1)
+        part = _rows([(1, 10), (2, 20), (3, 30)])
+        write_capture(tmp / "good.csv", part, rng)
+        frame, repairs = pm.read_capture_csv(tmp / "good.csv")
+        assert len(frame) == 3 and repairs == []
+        lines = (tmp / "good.csv").read_text().splitlines()
+        fields = lines[1].split(",")
+        cases = {
+            "missing_middle_field": ",".join(fields[:5] + fields[6:]),   # Protocol lost
+            "extra_field": lines[1] + ",X",
+        }
+        for name, bad in cases.items():
+            (tmp / f"{name}.csv").write_text("\n".join([lines[0], bad] + lines[2:]) + "\n")
+            try:
+                pm.read_capture_csv(tmp / f"{name}.csv")
+            except pm.SchemaError as exc:
+                assert "cannot be repaired" in str(exc), name
+            else:
+                raise AssertionError(f"{name}: malformed line accepted")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# =============================================================================
+# H. Output integrity
+# =============================================================================
+
+
+def test_outputs_readable_and_complete():
+    out = dataset()["out"]
+    for fname in EXPECTED_DISTRIBUTION:
+        df = pd.read_csv(out / fname)  # default parsing must also succeed
+        assert df.shape == (EXPECTED_ROWS[fname], 73), fname
+        assert df["Label"].notna().all()
+    assert {"processing_summary.csv", "aggregated_class_verification.csv", "validation_checks.csv",
+            "processing_report.md", "run_metadata.json"} <= {p.name for p in out.iterdir()}
+
+
+# =============================================================================
+# Real outputs (run on the machine that has D:\mscad)
+# =============================================================================
+
+REAL_OUTPUT_DIR = Path(os.environ.get("MSCAD_OUTPUT_DIR", r"D:\mscad\CSV_73Cols"))
+
+
+def test_real_outputs_if_available():
+    files = [REAL_OUTPUT_DIR / f for f in EXPECTED_DISTRIBUTION]
+    if not all(p.is_file() for p in files):
+        raise unittest.SkipTest(f"real outputs not found in {REAL_OUTPUT_DIR} (run the pipeline on the MSCAD data "
+                                "first, or set MSCAD_OUTPUT_DIR)")
+    for fname, path in zip(EXPECTED_DISTRIBUTION, files):
+        df = read_output(path)
+        assert list(df.columns) == pm.FINAL_COLUMNS, fname
+        assert len(df) == EXPECTED_ROWS[fname], f"{fname}: {len(df)} rows"
+        assert {k: int(v) for k, v in df["Label"].value_counts().items()} == EXPECTED_DISTRIBUTION[fname], fname
+        assert pm.parse_timestamps(df["Timestamp"])[0].dropna().is_monotonic_increasing, fname
+    checks = pd.read_csv(REAL_OUTPUT_DIR / "validation_checks.csv")
+    assert not (checks["Status"].isin(["FAIL", "WARN"])).any(), checks[checks["Status"].isin(["FAIL", "WARN"])].to_string()
+    cap = pd.read_csv(REAL_OUTPUT_DIR / "capture_reconciliation.csv").set_index("PCAP file")
+    assert cap.loc["W-B-01.pcap_Flow.csv", "Status"] == "Expected variation"
+    assert cap.loc["W-B-02.pcap_Flow.csv", "Status"] == "Reconciled"
+    assert cap.loc["N-0.pcap_Flow.csv", "Status"] == "Expected truncated baseline"
 
 
 if __name__ == "__main__":
+    failures = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"PASS {name}")
+            try:
+                fn()
+                print(f"PASS {name}")
+            except unittest.SkipTest as exc:
+                print(f"SKIP {name}: {exc}")
+            except Exception as exc:  # report every failing test
+                failures += 1
+                print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+    sys.exit(1 if failures else 0)
