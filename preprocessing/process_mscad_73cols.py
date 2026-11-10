@@ -25,6 +25,8 @@ Outputs (default ``D:\\mscad\\CSV_73Cols\\``)
 * ``processing_summary.csv``          per-file statistics
 * ``class_counts_per_file.csv``       per-file class counts, split by label source
 * ``aggregated_class_verification.csv`` class-by-class Kaggle-vs-PCAP coverage reconciliation
+* ``capture_reconciliation.csv``      per-capture extracted vs Kaggle counts, status and message
+* ``input_repairs.csv``               malformed input lines that were realigned (empty if none)
 * ``invalid_values_report.csv``       invalid numeric values per file and feature
 * ``schema_report.csv``               schema checks of the raw inputs
 * ``validation_checks.csv``           checks run after independently reloading the outputs
@@ -42,28 +44,38 @@ Labelling rules (verified per-capture ground truth), in priority order
    App-02 -> ICMP_Flood (45), Scan-1 -> Port_Scan (11,081), W-B-01 -> Web_Crwling (26).
    Signature matches are computed for these files only as diagnostics. A signature
    that the reference associates with another class (a collision) never changes a label.
-2. W-B-02 is the only mixed capture (Brute_Force 88,502 + Normal 24). Every flow
-   must be verified by exact matching against MSCAD.csv: first on all 66 features
-   (``kaggle_exact_66_features``), then, for flows with a missing/invalid feature
-   value, on the 12-feature signature (``kaggle_signature_12``). A flow is labelled
-   only when the matching reference rows carry exactly one permitted label.
-   Reference labels of other classes on an identical key belong to the other
-   captures (their counts are validated separately) and are reported as
-   cross-capture collisions.
-3. Ambiguous (Brute_Force and Normal on the same key), prohibited-only or
-   unmatched W-B-02 flows stop that capture: they are written to
-   ``_diagnostics/W-B-02.pcap_Flow.unresolved_rows.csv`` and no W-B-02 output is
-   written. Nothing is guessed.
+2. W-B-02 (expected: Brute_Force 88,526) is labelled by exact matching against
+   MSCAD.csv: all 66 features (``kaggle_exact_66_features``), otherwise the
+   12-feature signature (``kaggle_signature_12``). A flow is verified only when the
+   matching reference rows carry exactly one of Brute_Force / Normal. Reference labels
+   of other classes on an identical key belong to the other captures and are reported
+   as cross-capture collisions.
+3. A W-B-02 flow with no reference match gets Brute_Force by the attack-session rule
+   (``attack_session_rule``) only if its Src IP, Dst IP, Dst Port and Protocol equal
+   those of reference-verified Brute_Force flows and its timestamp lies within their
+   first..last timestamp (e.g. a TCP connection CICFlowMeter split into fragments).
+4. Ambiguous, prohibited-only or still unmatched W-B-02 flows stop that capture:
+   they are written to ``_diagnostics/W-B-02.pcap_Flow.unresolved_rows.csv`` (with the
+   reason the session rule did not apply) and no W-B-02 output is written.
+
+Malformed input lines
+---------------------
+A line with exactly one field fewer than the header, whose values only line up when
+an empty leading Flow ID is inserted (integer ports/protocol, valid Dst IP, parseable
+timestamp, numeric features), is realigned in memory and listed in
+``input_repairs.csv`` (the Src IP is kept as found and flagged if invalid). Any other
+malformed line fails its capture. Input files are never modified.
 
 Kaggle vs PCAP coverage
 -----------------------
 The six distributed captures yield 100,340 flows; MSCAD.csv has 128,799 rows.
-The 28,459-row difference is a coverage difference, reconciled class by class
-(each class counted once): Normal 28,502 - (21 N-0 + 24 W-B-02) = 28,457, and
-Web_Crwling 28 - 26 = 2. All other classes match exactly. No rows are added.
-The reconciliation passes only if the computed counts equal these verified
-values; any other difference fails as a labelling, flow-count or reference
-mismatch.
+Class by class (each counted once): Normal 28,502 - 21 = 28,481 (N-0 is a 21-row
+baseline slice; Kaggle Normal aggregates background traffic across sessions),
+Web_Crwling 28 - 26 = 2, Brute_Force 88,502 - 88,526 = -24 (W-B-02: 8 extra copies
+of reference flows + 17 attack-session fragments - 1 reference row not reproduced).
+Total 28,481 + 2 - 24 = 28,459. ``capture_reconciliation.csv`` states, per capture,
+the extracted and Kaggle counts and whether the difference is the documented one;
+any other difference fails as a labelling, flow-count or reference mismatch.
 
 Invalid numeric values
 ----------------------
@@ -98,6 +110,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import ipaddress
 import json
 import logging
@@ -146,10 +159,20 @@ SINGLE_CLASS_CAPTURES = {
     "W-B-01.pcap_Flow.csv": "Web_Crwling",
 }
 # Mixed-class captures: every flow's label must be established by exact matching against the Kaggle
-# reference; rows the reference cannot settle stop the capture (nothing is guessed).
+# reference (Brute_Force and Normal are both possible outcomes, so a key shared by both is ambiguous);
+# rows the reference cannot settle stop the capture unless the attack-session rule below verifies them.
 MIXED_CLASS_CAPTURES = {
     "W-B-02.pcap_Flow.csv": ("Brute_Force", "Normal"),
 }
+# Attack-session rule for flows of a mixed capture that match no reference row (e.g. a TCP connection that
+# CICFlowMeter split into fragments the Kaggle extraction does not contain). Such a flow gets the attack label
+# only if (Src IP, Dst IP, Dst Port, Protocol) equals that of flows verified by the reference with this label
+# AND its timestamp lies within the first..last timestamp of those verified flows (inclusive). Otherwise it
+# stays unresolved and stops the capture.
+SESSION_RULE_LABEL = {
+    "W-B-02.pcap_Flow.csv": "Brute_Force",
+}
+SESSION_KEY_COLUMNS = ["Src IP", "Dst IP", "Dst Port", "Protocol"]
 
 # Labels each capture may contain.
 ALLOWED_LABELS = {
@@ -165,16 +188,27 @@ EXPECTED_CAPTURE_DISTRIBUTION = {
     "App-02.pcap_Flow.csv": {"ICMP_Flood": 45},
     "Scan-1.pcap_Flow.csv": {"Port_Scan": 11_081},
     "W-B-01.pcap_Flow.csv": {"Web_Crwling": 26},
-    "W-B-02.pcap_Flow.csv": {"Brute_Force": 88_502, "Normal": 24},
+    "W-B-02.pcap_Flow.csv": {"Brute_Force": 88_526},
 }
 EXPECTED_RAW_TOTAL = 100_340
 
-# Why some Kaggle classes have more rows than the distributed PCAPs produce (coverage, not labelling).
+# Documented differences between a capture and the Kaggle count of its class. A difference is accepted as
+# expected only if it equals Kaggle count - verified capture count AND the capture's labels equal the verified
+# distribution; anything else fails. (Status shown in capture_reconciliation.csv.)
+CAPTURE_VARIATION_STATUS = {
+    "W-B-01.pcap_Flow.csv": "Expected variation",
+    "W-B-02.pcap_Flow.csv": "Reconciled",
+    "N-0.pcap_Flow.csv": "Expected truncated baseline",
+}
+
+# Why some Kaggle classes differ from the distributed PCAPs (coverage/extraction, not labelling).
 COVERAGE_NOTES = {
-    "Normal": ("N-0.pcap is a 21-flow baseline slice and W-B-02 contributes 24 Normal flows; the remaining "
-               "Kaggle Normal traffic was not distributed as PCAP"),
+    "Normal": ("Kaggle Normal aggregates background traffic across capture sessions; the distributed N-0 PCAP "
+               "is a 21-row baseline slice. Missing rows are not fabricated"),
     "Web_Crwling": ("W-B-01.pcap yields 26 flows while Kaggle lists 28; the missing rows are not "
                     "fabricated or inserted"),
+    "Brute_Force": ("W-B-02 yields more flows than Kaggle: extra copies of reference flows and attack-session "
+                    "fragments that the Kaggle extraction does not contain"),
 }
 
 assert set(ALLOWED_LABELS) == set(INPUT_FILES) == set(EXPECTED_CAPTURE_DISTRIBUTION)
@@ -335,7 +369,8 @@ READ_NA_TOKENS = ["", "NaN", "nan", "NAN", "NA", "N/A", "n/a", "null", "NULL", "
 SOURCE_CAPTURE_RULE = "capture_rule"               # authoritative single-class capture rule
 SOURCE_KAGGLE_FULL = "kaggle_exact_66_features"    # unique permitted label, all 66 features identical
 SOURCE_KAGGLE_SIG = "kaggle_signature_12"          # unique permitted label, 12-feature signature identical
-LABEL_SOURCES = (SOURCE_CAPTURE_RULE, SOURCE_KAGGLE_FULL, SOURCE_KAGGLE_SIG)
+SOURCE_SESSION_RULE = "attack_session_rule"        # unmatched flow inside a reference-verified attack session
+LABEL_SOURCES = (SOURCE_CAPTURE_RULE, SOURCE_KAGGLE_FULL, SOURCE_KAGGLE_SIG, SOURCE_SESSION_RULE)
 # Earlier label sources, no longer assigned (kept so existing imports keep working).
 SOURCE_SIGNATURE = "kaggle_signature"
 SOURCE_BASELINE = "baseline_rule"
@@ -401,6 +436,21 @@ def _peek_header(path: Path, encoding: str) -> list[str]:
             raise SchemaError(f"{path.name}: file is empty") from exc
 
 
+def _read_csv_frame(source, header: list[str], encoding: str | None = None) -> pd.DataFrame:
+    """pandas read with text columns kept as strings and features parsed at round-trip precision."""
+    text_raw = [h for h in header if _normalize_name(h) in TEXT_COLUMNS]
+    numeric_raw = [h for h in header if _normalize_name(h) not in TEXT_COLUMNS]
+    return pd.read_csv(
+        source,
+        encoding=encoding,
+        dtype={h: str for h in text_raw},
+        keep_default_na=False,
+        na_values={h: READ_NA_TOKENS for h in numeric_raw},
+        float_precision="round_trip",
+        low_memory=False,
+    )
+
+
 def read_flow_csv(path: Path) -> pd.DataFrame:
     """Read a flow CSV without altering text values.
 
@@ -413,23 +463,104 @@ def read_flow_csv(path: Path) -> pd.DataFrame:
     for encoding in ("utf-8-sig", "latin-1"):
         try:
             header = _peek_header(path, encoding)
-            text_raw = [h for h in header if _normalize_name(h) in TEXT_COLUMNS]
-            numeric_raw = [h for h in header if _normalize_name(h) not in TEXT_COLUMNS]
-            df = pd.read_csv(
-                path,
-                encoding=encoding,
-                dtype={h: str for h in text_raw},
-                keep_default_na=False,
-                na_values={h: READ_NA_TOKENS for h in numeric_raw},
-                float_precision="round_trip",
-                low_memory=False,
-            )
+            df = _read_csv_frame(path, header, encoding)
             if encoding != "utf-8-sig":
                 LOG.warning("%s: not valid UTF-8, read as latin-1", path.name)
             return df
         except UnicodeDecodeError as exc:
             last_error = exc
     raise SchemaError(f"{path.name}: cannot decode file ({last_error})")
+
+
+def _realign_missing_leading_field(fields: list[str], header: list[str]) -> list[str] | None:
+    """Return the line with an empty Flow ID inserted in front, if that makes it fully consistent.
+
+    Accepted only when the header starts with Flow ID, the line has exactly one field fewer than the
+    header, and after the shift: ports and protocol are integers, Dst IP is a valid IP address, the
+    timestamp parses, and every feature value is numeric (or a recognised missing/Infinity token).
+    Src IP is not checked: when the leading field is lost, the start of the Src IP can be lost with it.
+    """
+    names = [_normalize_name(h) for h in header]
+    if not names or names[0] != "Flow ID" or len(fields) != len(header) - 1:
+        return None
+    candidate = [""] + fields
+    position = {}
+    for i, name in enumerate(names):
+        position.setdefault(name, i)
+    value = lambda name: candidate[position[name]].strip()  # noqa: E731
+    try:
+        if not all(re.fullmatch(r"\d+", value(n)) for n in ("Src Port", "Dst Port", "Protocol")):
+            return None
+        ipaddress.ip_address(value("Dst IP"))
+        if parse_timestamps(pd.Series([value("Timestamp")]))[0].isna().any():
+            return None
+        for name in FEATURE_COLUMNS:
+            v = value(name).lower()
+            if v not in MISSING_TOKENS | POS_INF_TOKENS | NEG_INF_TOKENS and np.isnan(_safe_float(v)):
+                return None
+    except (KeyError, ValueError):
+        return None
+    return candidate
+
+
+def read_capture_csv(path: Path) -> tuple[pd.DataFrame, list[dict]]:
+    """Read one capture CSV and repair only lines that lack exactly the leading Flow ID field.
+
+    Such a line is otherwise loaded shifted one column to the left (every metadata and feature value in
+    the wrong column). It is realigned in memory only when ``_realign_missing_leading_field`` accepts it;
+    the input file is never modified. Every repair is returned for the reports. Any other line whose
+    field count differs from the header raises SchemaError, so the capture fails visibly.
+    """
+    rows = None
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            with open(path, "r", encoding=encoding, newline="") as fh:
+                rows = list(csv.reader(fh))
+            break
+        except UnicodeDecodeError:
+            continue
+    if rows is None:
+        raise SchemaError(f"{path.name}: cannot decode file")
+    if not rows:
+        raise SchemaError(f"{path.name}: file is empty")
+    header = rows[0]
+    malformed = [i for i, r in enumerate(rows[1:], start=1) if r and len(r) != len(header)]
+    if not malformed:
+        return read_flow_csv(path), []
+
+    names = [_normalize_name(h) for h in header]
+    src_ip_pos = names.index("Src IP") if "Src IP" in names else None
+    data_row = {i: k for k, i in enumerate(i for i, r in enumerate(rows[1:], start=1) if r)}
+    repairs, problems = [], []
+    for i in malformed:
+        fixed = _realign_missing_leading_field(rows[i], header)
+        if fixed is None:
+            problems.append(f"line {i + 1}: {len(rows[i])} fields (header {len(header)})")
+            continue
+        src_ip = fixed[src_ip_pos].strip() if src_ip_pos is not None else ""
+        try:
+            ipaddress.ip_address(src_ip)
+            src_valid = True
+        except ValueError:
+            src_valid = False
+        repairs.append({
+            "CSV line": i + 1,
+            "Data row": data_row[i],
+            "Fields found": len(rows[i]),
+            "Header fields": len(header),
+            "Repair": "missing leading Flow ID field: realigned one column to the right",
+            "Src IP as found": src_ip,
+            "Src IP valid": src_valid,
+            "Original line start": " | ".join(rows[i][:6]),
+        })
+        rows[i] = fixed
+    if problems:
+        raise SchemaError(f"{path.name}: malformed lines that cannot be repaired safely: " + "; ".join(problems[:10]))
+
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerows(r for r in rows if r)
+    buffer.seek(0)
+    return _read_csv_frame(buffer, header), repairs
 
 
 # =============================================================================
@@ -931,6 +1062,7 @@ def resolve_mixed_capture_labels(
     over = np.zeros(n, dtype=bool)
     open_rows = np.ones(n, dtype=bool)
     level_stats = {}
+    extra_copies = {lab: 0 for lab in permitted}
 
     for name, columns, lookup in levels:
         match, _ = match_ground_truth_labels(parsed[columns], lookup, set(LABEL_ENCODING), columns=columns)
@@ -961,6 +1093,12 @@ def resolve_mixed_capture_labels(
             group = keys.groupby(columns, sort=False).ngroup().to_numpy()
             multiplicity = np.bincount(group)[group]
             over[idx[multiplicity > counts.max(axis=1)[idx]]] = True
+            # Capture rows beyond the number of reference rows with the same key and label.
+            _, first = np.unique(group, return_index=True)
+            group_rows = idx[first]
+            surplus = np.bincount(group)[group[first]] - counts.max(axis=1)[group_rows]
+            for lab in permitted:
+                extra_copies[lab] += int(surplus[(chosen[group_rows] == lab) & (surplus > 0)].sum())
 
         level_stats[name] = {
             "key_columns": len(columns),
@@ -993,12 +1131,60 @@ def resolve_mixed_capture_labels(
         "unmatched": int((status == MIX_UNMATCHED).sum()),
         "cross_capture_collisions_resolved": int(cross.sum()),
         "rows_exceeding_reference_multiplicity": int(over.sum()),
+        "extra_copies_by_label": extra_copies,
+        "one_to_one_by_label": {lab: int((verified_all & (label == lab)).sum()) - extra_copies[lab] for lab in permitted},
     }
     return result, stats
 
 
+def apply_attack_session_rule(
+    resolved: pd.DataFrame, meta: pd.DataFrame, attack_label: str
+) -> tuple[pd.DataFrame, dict]:
+    """Verify unmatched flows of a mixed capture against the verified attack sessions.
+
+    An unmatched flow gets ``attack_label`` only if its (Src IP, Dst IP, Dst Port, Protocol) equals that of
+    flows the reference verified as ``attack_label`` and its timestamp lies within the first..last timestamp
+    of those verified flows (inclusive). Ambiguous and prohibited-only rows are never touched. Returns the
+    updated per-row frame (``Evidence_Level`` = SOURCE_SESSION_RULE for the rows labelled here) and stats.
+    """
+    resolved = resolved.copy()
+    key = meta[SESSION_KEY_COLUMNS].astype(str).apply(lambda c: c.str.strip()).agg("|".join, axis=1).to_numpy()
+    ts, _ = parse_timestamps(meta["Timestamp"])
+    ts = ts.to_numpy()
+    verified = ((resolved["Mixed_Status"] == MIX_VERIFIED) & (resolved["Mixed_Label"] == attack_label)).to_numpy()
+    unmatched = (resolved["Mixed_Status"] == MIX_UNMATCHED).to_numpy()
+
+    windows = (pd.DataFrame({"key": key[verified], "ts": ts[verified]}).dropna()
+               .groupby("key")["ts"].agg(["min", "max", "size"]))
+    accepted = np.zeros(len(resolved), dtype=bool)
+    reasons = np.full(len(resolved), "", dtype=object)
+    for i in np.flatnonzero(unmatched):
+        if key[i] not in windows.index:
+            reasons[i] = "no verified attack flow with the same Src IP, Dst IP, Dst Port and Protocol"
+        elif pd.isna(ts[i]):
+            reasons[i] = "unparseable timestamp"
+        elif not (windows.at[key[i], "min"] <= ts[i] <= windows.at[key[i], "max"]):
+            reasons[i] = "outside the time window of the verified attack flows with this key"
+        else:
+            accepted[i] = True
+    resolved.loc[accepted, "Mixed_Status"] = MIX_VERIFIED
+    resolved.loc[accepted, "Mixed_Label"] = attack_label
+    resolved.loc[accepted, "Evidence_Level"] = SOURCE_SESSION_RULE
+    resolved["Session_Rule_Reason"] = pd.Series(reasons, dtype=object)
+    used = sorted(set(key[accepted]))
+    stats = {
+        "session_rule_rows": int(accepted.sum()),
+        "session_rule_rejected": int((unmatched & ~accepted).sum()),
+        "session_keys_used": {k: {"verified_flows": int(windows.at[k, "size"]), "first": str(windows.at[k, "min"]),
+                                  "last": str(windows.at[k, "max"]), "rows_added": int((key[accepted] == k).sum())}
+                              for k in used},
+    }
+    return resolved, stats
+
+
 def assign_capture_labels(
-    filename: str, parsed: pd.DataFrame, lookup: pd.DataFrame, full_lookup: pd.DataFrame | None = None
+    filename: str, parsed: pd.DataFrame, lookup: pd.DataFrame, full_lookup: pd.DataFrame | None = None,
+    meta: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, dict]:
     """Label one capture with the verified per-capture rules, in priority order.
 
@@ -1006,8 +1192,9 @@ def assign_capture_labels(
        The 12-feature signature match is computed only as a diagnostic; a signature that the
        reference associates with another class (a collision) never changes the label.
     2. Mixed-class capture (``MIXED_CLASS_CAPTURES``): every row must be verified by exact reference
-       matching (66 features when ``full_lookup`` is given, then the 12-feature signature).
-    3. Any ambiguous, prohibited or unmatched row in a mixed capture raises UnresolvedLabelsError.
+       matching (66 features when ``full_lookup`` is given, then the 12-feature signature). When ``meta``
+       (the metadata columns) is given, unmatched rows may be verified by ``apply_attack_session_rule``.
+    3. Any ambiguous, prohibited or still unmatched row in a mixed capture raises UnresolvedLabelsError.
 
     ``lookup`` is the 12-feature lookup and ``full_lookup`` the 66-feature lookup, both from
     ``prepare_signature_lookup``. Returns labels, per-row provenance and statistics.
@@ -1043,6 +1230,14 @@ def assign_capture_labels(
             levels.append((SOURCE_KAGGLE_FULL, FEATURE_COLUMNS, full_lookup))
         levels.append((SOURCE_KAGGLE_SIG, SIGNATURE_COLUMNS, lookup))
         resolved, mstats = resolve_mixed_capture_labels(parsed, levels, ALLOWED_LABELS[filename])
+        mstats["unmatched_before_session_rule"] = mstats["unmatched"]
+        if meta is not None and filename in SESSION_RULE_LABEL and mstats["unmatched"]:
+            resolved, sstats = apply_attack_session_rule(resolved, meta.reset_index(drop=True),
+                                                         SESSION_RULE_LABEL[filename])
+            mstats.update(sstats)
+            mstats["unmatched"] = int((resolved["Mixed_Status"] == MIX_UNMATCHED).sum())
+        else:
+            mstats.update(session_rule_rows=0, session_rule_rejected=0, session_keys_used={})
         unresolved = (resolved["Mixed_Status"] != MIX_VERIFIED).to_numpy()
         if unresolved.any():
             raise UnresolvedLabelsError(
@@ -1188,7 +1383,11 @@ def process_single_file(
             _guard_output_path(stale, cfg)
             stale.unlink()
 
-    raw = read_flow_csv(path)
+    raw, repairs = read_capture_csv(path)
+    result["input_repairs"] = repairs
+    for r in repairs:
+        LOG.warning("  repaired input line %d (%s); Src IP as found: %r%s", r["CSV line"], r["Repair"],
+                    r["Src IP as found"], "" if r["Src IP valid"] else " (not a valid IP address; kept as found)")
     result["input_rows"] = int(len(raw))
     raw = normalize_columns(raw)
     raw, dup_notes = resolve_duplicate_columns(raw, filename)
@@ -1224,7 +1423,7 @@ def process_single_file(
 
     # Stages 1-2: verified per-capture labelling (single-class rule, or exact reference matching).
     try:
-        labels, label_prov, lstats = assign_capture_labels(filename, parsed, lookup, full_lookup)
+        labels, label_prov, lstats = assign_capture_labels(filename, parsed, lookup, full_lookup, meta=meta)
     except UnresolvedLabelsError as exc:
         rows = exc.rows
         detail = pd.concat([
@@ -1246,10 +1445,10 @@ def process_single_file(
                  lstats["signature_rows_in_reference"], lstats["signature_collisions_overridden"],
                  lstats["signature_rows_not_in_reference"])
     else:
-        LOG.info("  reference matching: verified %d %s | per level %s | cross-capture collisions %d | "
-                 "rows exceeding reference multiplicity %d", lstats["verified"], lstats["verified_by_label"],
-                 {k: v["verified"] for k, v in lstats["levels"].items()},
-                 lstats["cross_capture_collisions_resolved"], lstats["rows_exceeding_reference_multiplicity"])
+        LOG.info("  reference matching: verified %d %s | per level %s | extra copies %s | cross-capture "
+                 "collisions %d | attack-session rule %d rows", lstats["verified"], lstats["verified_by_label"],
+                 {k: v["verified"] for k, v in lstats["levels"].items()}, lstats["extra_copies_by_label"],
+                 lstats["cross_capture_collisions_resolved"], lstats["session_rule_rows"])
 
     if any(lab is None or lab == "" for lab in labels):
         raise PipelineError(f"{filename}: rows left without a label (internal error)")
@@ -1274,6 +1473,7 @@ def process_single_file(
             "Src_In_Victim_Net": src_in,
             "Dst_In_Victim_Net": dst_in,
             "Invalid_Feature_Values": modified_per_row,
+            "Input_Repair": pd.Series(input_row).map({r["Data row"]: r["Repair"] for r in repairs}).fillna("").to_numpy(),
         }),
     ], axis=1)
     prov_cols = list(provenance.columns)
@@ -1347,6 +1547,8 @@ REPORT_CSV_FILES = (
     "invalid_values_report.csv",
     "schema_report.csv",
     "validation_checks.csv",
+    "capture_reconciliation.csv",
+    "input_repairs.csv",
 )
 
 CHECK_CATEGORIES = {
@@ -1419,8 +1621,12 @@ def validate_outputs(results: list[dict], cfg: argparse.Namespace) -> list[dict]
         add(fname, "chronologically sorted", bool(mono and invalid_at_end), category="timestamps")
 
         # Integrity against the raw input, reloaded independently.
-        raw = read_flow_csv(cfg.input_dir / fname)
+        raw, repairs = read_capture_csv(cfg.input_dir / fname)
         raw = normalize_columns(raw)
+        for r in repairs:
+            checks.append({"File": fname, "Category": "integrity", "Check": "malformed input line realigned (documented)",
+                           "Status": "INFO", "Detail": f"CSV line {r['CSV line']}: {r['Repair']}; Src IP as found "
+                                                       f"{r['Src IP as found']!r} (valid IP: {r['Src IP valid']})"})
         raw, _ = resolve_duplicate_columns(raw, fname)
         in_rows = prov["input_row"].astype(int).to_numpy()
         expected_rows = len(raw) - res["dropped_rows"]
@@ -1490,14 +1696,15 @@ def reconcile_coverage(results: list[dict], reference_class_counts: dict) -> tup
         elif gap == 0:
             category = "EXACT_MATCH"
         else:
-            category = "EXPECTED_COVERAGE_GAP"
+            category = "EXPECTED_VARIATION"
         sources = ", ".join(f"{f.replace('.pcap_Flow.csv', '')}: {n:,}" for f, n in per_file.items() if n) or "none"
         if category == "EXACT_MATCH":
             explanation = f"All {kaggle:,} Kaggle rows are reproduced by the distributed captures ({sources})."
-        elif category == "EXPECTED_COVERAGE_GAP":
+        elif category == "EXPECTED_VARIATION":
+            difference = (f"{gap:,} Kaggle rows have no flow in the distributed PCAPs. " if gap > 0 else
+                          f"The distributed captures yield {-gap:,} more flows than Kaggle lists. ")
             explanation = (f"Kaggle has {kaggle:,} rows; the distributed captures yield {pcap:,} ({sources}). "
-                           f"{gap:,} Kaggle rows have no flow in the distributed PCAPs. "
-                           + COVERAGE_NOTES.get(lab, "") + ".")
+                           + difference + COVERAGE_NOTES.get(lab, "") + ".")
         else:
             explanation = (f"Kaggle {kaggle:,} (verified {EXPECTED_CLASS_COUNTS[lab]:,}); PCAP output {pcap:,} "
                            f"(verified {expected_pcap[lab]:,}). This difference is not an expected coverage gap.")
@@ -1508,7 +1715,7 @@ def reconcile_coverage(results: list[dict], reference_class_counts: dict) -> tup
             "Documented Coverage Gap": documented_gap, "Category": category, "Explanation": explanation,
         })
         checks.append({"File": "ALL", "Category": "coverage", "Check": f"{lab}: Kaggle-vs-PCAP difference accounted for",
-                       "Status": "PASS" if category in ("EXACT_MATCH", "EXPECTED_COVERAGE_GAP") else "FAIL",
+                       "Status": "PASS" if category in ("EXACT_MATCH", "EXPECTED_VARIATION") else "FAIL",
                        "Detail": f"{category}: Kaggle {kaggle:,} - PCAP {pcap:,} = {gap:,}"})
 
     table = pd.DataFrame(rows)
@@ -1516,9 +1723,11 @@ def reconcile_coverage(results: list[dict], reference_class_counts: dict) -> tup
     pcap_total = int(table["PCAP Output Rows"].sum())
     total_gap = kaggle_total - pcap_total
     documented_total = int(table["Documented Coverage Gap"].sum())
-    gap_parts = " + ".join(f"{r['Class']} {r['Difference (Kaggle - PCAP)']:,}" for r in rows
-                           if r["Difference (Kaggle - PCAP)"])
-    total_category = ("EXPECTED_COVERAGE_GAP" if all(r["Category"] in ("EXACT_MATCH", "EXPECTED_COVERAGE_GAP")
+    positive = [f"{r['Class']} {r['Difference (Kaggle - PCAP)']:,}" for r in rows if r["Difference (Kaggle - PCAP)"] > 0]
+    negative = [f"{r['Class']} {-r['Difference (Kaggle - PCAP)']:,}" for r in rows if r["Difference (Kaggle - PCAP)"] < 0]
+    gap_parts = " + ".join(positive) + "".join(f" - {n}" for n in negative)
+    gap_parts = gap_parts if positive else gap_parts.lstrip(" ")
+    total_category = ("EXPECTED_VARIATION" if all(r["Category"] in ("EXACT_MATCH", "EXPECTED_VARIATION")
                                                       for r in rows) else "MISMATCH")
     table = pd.concat([table, pd.DataFrame([{
         "Class": "TOTAL", "Class ID": "", "Kaggle Rows": kaggle_total, "PCAP Output Rows": pcap_total,
@@ -1542,6 +1751,98 @@ def reconcile_coverage(results: list[dict], reference_class_counts: dict) -> tup
          "Detail": f"{total_gap:,} = {gap_parts or '0'}; documented {documented_total:,}"},
     ]
     return table, checks
+
+
+def _capture_class(fname: str) -> str:
+    """The class whose Kaggle count a capture is compared with."""
+    if fname in SINGLE_CLASS_CAPTURES:
+        return SINGLE_CLASS_CAPTURES[fname]
+    return SESSION_RULE_LABEL.get(fname, MIXED_CLASS_CAPTURES[fname][0])
+
+
+def reconcile_captures(results: list[dict], reference_class_counts: dict) -> tuple[pd.DataFrame, list[dict]]:
+    """Per-capture comparison of extracted rows with the Kaggle count of the capture's class.
+
+    A difference is accepted only when the capture's labels equal the verified distribution, the Kaggle
+    count equals its verified value, and the difference equals the documented one (Kaggle count minus
+    verified capture count) with a status in CAPTURE_VARIATION_STATUS. For a mixed capture the difference
+    must also equal its computed breakdown (extra copies + attack-session rows - reference rows not reproduced).
+    """
+    by_file = {r["filename"]: r for r in results}
+    rows, checks = [], []
+    for fname in INPUT_FILES:
+        res = by_file.get(fname, {})
+        short = fname.split(".pcap")[0]
+        cls = _capture_class(fname)
+        expected = EXPECTED_CAPTURE_DISTRIBUTION[fname]
+        ok_run = res.get("status") == "OK"
+        counts = {k: v for k, v in res.get("validated_class_counts", {}).items() if v} if ok_run else {}
+        n = sum(counts.values())
+        kaggle = int(reference_class_counts.get(cls, 0))
+        diff = kaggle - counts.get(cls, 0)
+        documented = EXPECTED_CLASS_COUNTS[cls] - expected.get(cls, 0)
+        share_text = "100%" if n and counts.get(cls, 0) == n else (f"{100.0 * counts.get(cls, 0) / n:.2f}%" if n else "0%")
+        lab = res.get("labelling", {})
+        breakdown_ok, breakdown = True, ""
+        if fname in MIXED_CLASS_CAPTURES and ok_run:
+            extra = lab.get("extra_copies_by_label", {}).get(cls, 0)
+            session = lab.get("session_rule_rows", 0)
+            not_reproduced = kaggle - lab.get("one_to_one_by_label", {}).get(cls, 0)
+            breakdown_ok = extra + session - not_reproduced == -diff
+            breakdown = (f"{extra:,} extra copies of reference flows + {session:,} attack-session fragments not in "
+                         f"the reference - {not_reproduced:,} reference row(s) not reproduced")
+
+        if not ok_run:
+            status, passed = "FAILED", False
+            message = f"{short}: not processed ({res.get('error', 'no result')})."
+        elif counts != expected:
+            status, passed = "Labelling mismatch", False
+            message = f"{short}: labels {counts} differ from the verified distribution {expected}."
+        elif kaggle != EXPECTED_CLASS_COUNTS[cls]:
+            status, passed = "Reference mismatch", False
+            message = f"{short}: Kaggle {cls} count {kaggle:,} differs from the verified {EXPECTED_CLASS_COUNTS[cls]:,}."
+        elif diff != documented or not breakdown_ok:
+            status, passed = "Unexpected difference", False
+            message = (f"{short}: Kaggle {kaggle:,} {cls} vs {n:,} extracted; difference {diff:,} is not the "
+                       f"documented {documented:,}" + (f" or does not equal its breakdown ({breakdown})" if breakdown else "")
+                       + ".")
+        elif diff == 0:
+            status, passed = "Exact match", True
+            message = f"{short}: {n:,} extracted rows assigned {cls} ({share_text}); matches the {kaggle:,} Kaggle {cls} rows."
+        elif fname not in CAPTURE_VARIATION_STATUS:
+            status, passed = "Unexpected difference", False
+            message = f"{short}: Kaggle {kaggle:,} {cls} vs {n:,} extracted; no documented variation for this capture."
+        else:
+            status, passed = CAPTURE_VARIATION_STATUS[fname], True
+            if cls == NORMAL_LABEL:
+                message = (f"{short}: All {n:,} extracted rows assigned Normal ({share_text}). Kaggle contains "
+                           f"{kaggle:,} Normal rows in total; the {diff:,}-row difference reflects aggregated "
+                           f"background traffic across capture sessions that is not present in the distributed "
+                           f"{n:,}-row {short} PCAP slice.")
+            elif fname in MIXED_CLASS_CAPTURES:
+                message = (f"{short}: {n:,} extracted rows assigned {cls} ({share_text}). Kaggle reference contains "
+                           f"{kaggle:,} {cls} rows; the {abs(diff):,}-row difference is an expected PCAP extraction "
+                           f"variation: {breakdown}.")
+            else:
+                message = (f"{short}: {n:,} extracted rows assigned {cls} ({share_text}). Kaggle reference contains "
+                           f"{kaggle:,} {cls} rows; the {abs(diff):,}-row difference is an expected PCAP extraction "
+                           f"variation.")
+        repairs = res.get("input_repairs", [])
+        if ok_run and repairs:
+            message += f" {len(repairs)} malformed input line(s) were realigned before labelling (see input_repairs.csv)."
+        rows.append({
+            "PCAP file": fname,
+            "Extracted rows": n if ok_run else res.get("input_rows", ""),
+            "Kaggle reference rows": f"{kaggle:,} {cls}",
+            "Final labels": " + ".join(f"{v:,} {k}" for k, v in counts.items()) or "-",
+            "Kaggle - Extracted": diff if ok_run else "",
+            "Difference": abs(diff) if ok_run else "",
+            "Status": status,
+            "Message": message,
+        })
+        checks.append({"File": fname, "Category": "coverage", "Check": "capture reconciled with the Kaggle reference",
+                       "Status": "PASS" if passed else "FAIL", "Detail": f"{status}: {message}"})
+    return pd.DataFrame(rows), checks
 
 
 # =============================================================================
@@ -1586,10 +1887,13 @@ def _summary_row(res: dict) -> dict:
         "Capture-Rule Rows": from_source(SOURCE_CAPTURE_RULE),
         "Verified By Exact 66-Feature Match": from_source(SOURCE_KAGGLE_FULL),
         "Verified By 12-Feature Signature": from_source(SOURCE_KAGGLE_SIG),
+        "Verified By Attack-Session Rule": from_source(SOURCE_SESSION_RULE),
+        "Extra Copies Of Reference Flows": "" if single else sum(lab.get("extra_copies_by_label", {}).values()),
         "Signature Collisions Overridden By Capture Rule": lab.get("signature_collisions_overridden", "") if single else "",
         "Cross-Capture Collisions Resolved": "" if single else lab.get("cross_capture_collisions_resolved", ""),
         "Rows Exceeding Reference Multiplicity": "" if single else lab.get("rows_exceeding_reference_multiplicity", ""),
         "Unresolved Rows": res.get("unresolved_rows", 0 if ok else ""),
+        "Repaired Input Lines": len(res.get("input_repairs", [])),
         "Invalid Numeric Values": res.get("invalid_numeric_values", ""),
         "Rows With Invalid Values": res.get("rows_with_invalid_values", ""),
         "Imputed Cells": res.get("imputed_cells", ""),
@@ -1605,7 +1909,7 @@ def _summary_row(res: dict) -> dict:
 
 
 def generate_verification_report(results, checks, ref_info, lookup_stats, cfg, run_meta,
-                                 coverage: pd.DataFrame) -> pd.DataFrame:
+                                 coverage: pd.DataFrame, captures: pd.DataFrame | None = None) -> pd.DataFrame:
     out = cfg.output_dir
     summary = pd.DataFrame([_summary_row(r) for r in results])
     summary.to_csv(out / "processing_summary.csv", index=False, encoding="utf-8")
@@ -1623,11 +1927,19 @@ def generate_verification_report(results, checks, ref_info, lookup_stats, cfg, r
                 "From Capture Rule": src[SOURCE_CAPTURE_RULE],
                 "From Exact 66-Feature Match": src[SOURCE_KAGGLE_FULL],
                 "From 12-Feature Signature": src[SOURCE_KAGGLE_SIG],
+                "From Attack-Session Rule": src[SOURCE_SESSION_RULE],
                 "Permitted In Capture": lab in ALLOWED_LABELS[r["filename"]],
             })
     pd.DataFrame(class_rows).to_csv(out / "class_counts_per_file.csv", index=False, encoding="utf-8")
 
     coverage.to_csv(out / "aggregated_class_verification.csv", index=False, encoding="utf-8")
+    if captures is None:
+        captures = pd.DataFrame()
+    captures.to_csv(out / "capture_reconciliation.csv", index=False, encoding="utf-8")
+    repair_rows = [{"Filename": r["filename"], **rep_} for r in results for rep_ in r.get("input_repairs", [])]
+    pd.DataFrame(repair_rows, columns=["Filename", "CSV line", "Data row", "Fields found", "Header fields", "Repair",
+                                       "Src IP as found", "Src IP valid", "Original line start"]) \
+        .to_csv(out / "input_repairs.csv", index=False, encoding="utf-8")
 
     inv_rows = []
     for r in results:
@@ -1657,9 +1969,10 @@ def generate_verification_report(results, checks, ref_info, lookup_stats, cfg, r
 
     with open(out / "run_metadata.json", "w", encoding="utf-8") as fh:
         json.dump({**run_meta, "reference": ref_info, "signature_lookup": lookup_stats,
-                   "coverage": coverage.to_dict(orient="records"), "per_file": results}, fh, indent=2, default=str)
+                   "coverage": coverage.to_dict(orient="records"),
+                   "captures": captures.to_dict(orient="records"), "per_file": results}, fh, indent=2, default=str)
 
-    _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cfg, run_meta)
+    _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cfg, run_meta, captures)
     return coverage
 
 
@@ -1675,13 +1988,13 @@ def _status_counts(checks) -> dict:
     return {s: sum(c["Status"] == s for c in checks) for s in ("PASS", "FAIL", "WARN", "INFO")}
 
 
-def _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cfg, run_meta):
+def _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cfg, run_meta, captures=None):
     counts = _status_counts(checks)
     key_cols = ["Filename", "Status", "Labelling Mode", "Input Rows", "Output Rows", "Expected Rows",
                 "Output Columns", "Label Distribution", "Distribution Matches Expected", "Capture-Rule Rows",
                 "Verified By Exact 66-Feature Match", "Verified By 12-Feature Signature",
-                "Signature Collisions Overridden By Capture Rule", "Unresolved Rows", "Invalid Numeric Values",
-                "Invalid Timestamps", "Dropped Rows"]
+                "Verified By Attack-Session Rule", "Signature Collisions Overridden By Capture Rule",
+                "Unresolved Rows", "Repaired Input Lines", "Invalid Numeric Values", "Invalid Timestamps", "Dropped Rows"]
     category_rows = []
     for key, title in CHECK_CATEGORIES.items():
         group = [c for c in checks if c.get("Category") == key]
@@ -1703,17 +2016,29 @@ def _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cf
         "",
         "1. **capture_rule**: single-class captures (N-0, App-01, App-02, Scan-1, W-B-01). Every flow gets the "
         "capture's class; signature matches are diagnostics only and never change these labels.",
-        "2. **kaggle_exact_66_features / kaggle_signature_12**: W-B-02, the only mixed capture. Each flow is "
-        "labelled only if all 66 features (or, when a feature is missing/invalid, the 12-feature signature) "
-        "match Kaggle reference rows carrying exactly one of the permitted labels (Brute_Force, Normal).",
-        "3. Ambiguous, prohibited-only or unmatched W-B-02 flows stop that capture; they are listed in "
+        "2. **kaggle_exact_66_features / kaggle_signature_12**: W-B-02, the only mixed capture. A flow is "
+        "verified when all 66 features (otherwise the 12-feature signature) match Kaggle reference rows carrying "
+        "exactly one of the permitted labels (Brute_Force, Normal).",
+        "3. **attack_session_rule**: a W-B-02 flow with no reference match gets Brute_Force only if its Src IP, "
+        "Dst IP, Dst Port and Protocol equal those of reference-verified Brute_Force flows and its timestamp lies "
+        "within their first..last timestamp.",
+        "4. Ambiguous, prohibited-only or still unmatched W-B-02 flows stop that capture; they are listed in "
         "`_diagnostics/W-B-02.pcap_Flow.unresolved_rows.csv` and nothing is guessed.",
+        "",
+        "Input lines that lack exactly their leading Flow ID field are realigned one column before processing "
+        "(listed in `input_repairs.csv`); any other malformed line fails its capture.",
         "",
         "Per-row label source: `_provenance/`.",
         "",
         "## Per-file summary",
         "",
         _md_table(summary[key_cols]),
+        "",
+        "## Capture reconciliation (extracted PCAP rows vs Kaggle reference)",
+        "",
+        _md_table(captures.drop(columns=["Message"])) if captures is not None and not captures.empty else "_not available_",
+        "",
+        *[f"* {m}" for m in (captures["Message"] if captures is not None and not captures.empty else [])],
         "",
         "## Kaggle vs PCAP coverage (each class counted once)",
         "",
@@ -1772,7 +2097,7 @@ def _setup_logging(output_dir: Path | None = None) -> None:
         LOG.addHandler(fh)
 
 
-def _print_tables(results, coverage, checks) -> None:
+def _print_tables(results, coverage, checks, captures=None) -> None:
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 50)
     pd.set_option("display.max_colwidth", 60)
@@ -1780,7 +2105,12 @@ def _print_tables(results, coverage, checks) -> None:
     LOG.info("\nPER-FILE SUMMARY\n%s", summary[[
         "Filename", "Status", "Input Rows", "Output Rows", "Expected Rows", "Output Columns", "Label Distribution",
         "Distribution Matches Expected", "Capture-Rule Rows", "Verified By Exact 66-Feature Match",
-        "Verified By 12-Feature Signature", "Unresolved Rows", "Invalid Timestamps", "Dropped Rows"]].to_string(index=False))
+        "Verified By 12-Feature Signature", "Verified By Attack-Session Rule", "Unresolved Rows",
+        "Repaired Input Lines", "Invalid Timestamps", "Dropped Rows"]].to_string(index=False))
+    if captures is not None and not captures.empty:
+        LOG.info("\nCAPTURE RECONCILIATION\n%s", captures.drop(columns=["Message"]).to_string(index=False))
+        for message in captures["Message"]:
+            LOG.info("  %s", message)
     LOG.info("\nKAGGLE vs PCAP COVERAGE\n%s", coverage.drop(columns=["Explanation"]).to_string(index=False))
     for _, row in coverage.iterrows():
         LOG.info("  %s: %s", row["Class"], row["Explanation"])
@@ -1869,7 +2199,8 @@ def main(argv=None) -> int:
     LOG.info("Independent validation of the written outputs")
     checks = validate_outputs(results, cfg)
     coverage, coverage_checks = reconcile_coverage(results, ref_info["class_counts"])
-    checks += coverage_checks
+    captures, capture_checks = reconcile_captures(results, ref_info["class_counts"])
+    checks += coverage_checks + capture_checks
 
     input_sha_after = {f: sha256_of(cfg.input_dir / f) for f in INPUT_FILES}
     ref_sha_after = sha256_of(ref_path)
@@ -1897,8 +2228,8 @@ def main(argv=None) -> int:
         "signature_columns": SIGNATURE_COLUMNS,
         "timestamp_format": TIMESTAMP_FORMAT,
     }
-    coverage = generate_verification_report(results, checks, ref_info, lookup_stats, cfg, run_meta, coverage)
-    _print_tables(results, coverage, checks)
+    coverage = generate_verification_report(results, checks, ref_info, lookup_stats, cfg, run_meta, coverage, captures)
+    _print_tables(results, coverage, checks, captures)
     LOG.info("Reports written to %s", cfg.output_dir)
 
     ok = all(r["status"] == "OK" for r in results) and not any(c["Status"] == "FAIL" for c in checks)
