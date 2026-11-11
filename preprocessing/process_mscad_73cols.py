@@ -78,8 +78,10 @@ row's ``Extraction_Artefact`` in ``_provenance/`` names a known artefact of CICF
 Stage C packet-level audit (empty when none applies):
 * ``arp_misread_as_ipv4``      Src/Dst IP 8.0.6.4 / 8.6.0.1: ARP frames read as IPv4 at the wrong offset (the
                                "addresses" are the ARP header bytes 08 00 06 04 and 08 06 00 01).
-* ``tcp_fin_tail_candidate``   TCP flow without SYN, with a FIN, of at most 3 packets: typically the remainder
-                               of a connection after CICFlowMeter closed the main flow at the first FIN.
+* ``tcp_fin_tail_candidate``   TCP flow of at most 3 packets without SYN or RST: typically the remainder of a
+                               connection after CICFlowMeter closed the main flow at the first FIN. The FIN of
+                               the tail itself is often not counted in ``FIN Flag Cnt`` (W-B-02: 44,163 of
+                               44,259 tails show 0), so the rule does not require it.
 * ``non_tcp_udp_protocol_0``   any other Protocol 0 row: ICMP, IGMP or IP fragments, which CICFlowMeter writes
                                as protocol 0 with ports 0 (e.g. the fragmented FIN scan in Scan-1 is one row).
 ``extraction_artefacts.csv`` lists the counts per file. Flags are informational and never affect labels.
@@ -238,7 +240,7 @@ KNOWN_DAMAGED_INPUTS = {
 ARP_MISREAD_ADDRESSES = {"8.0.6.4", "8.6.0.1"}
 ARTEFACT_FLAGS = {
     "arp_misread_as_ipv4": "ARP frames read as IPv4 (Src/Dst IP 8.0.6.4 / 8.6.0.1 are ARP header bytes)",
-    "tcp_fin_tail_candidate": ("TCP flow without SYN, with FIN, <= 3 packets: typically the rest of a connection "
+    "tcp_fin_tail_candidate": ("TCP flow of <= 3 packets without SYN or RST: typically the rest of a connection "
                                "after CICFlowMeter closed the main flow at the first FIN"),
     "non_tcp_udp_protocol_0": "ICMP, IGMP or IP fragments, written by CICFlowMeter as protocol 0 with ports 0",
 }
@@ -1402,7 +1404,8 @@ def flag_extraction_artefacts(meta: pd.DataFrame, parsed: pd.DataFrame) -> np.nd
     num = lambda col: pd.to_numeric(parsed[col], errors="coerce").fillna(0).to_numpy()  # noqa: E731
     packets = num("Tot Fwd Pkts") + num("Tot Bwd Pkts")
     arp = (src.isin(ARP_MISREAD_ADDRESSES) & dst.isin(ARP_MISREAD_ADDRESSES)).to_numpy()
-    tail = (proto == "6").to_numpy() & (num("SYN Flag Cnt") == 0) & (num("FIN Flag Cnt") >= 1) & (packets <= 3)
+    # no FIN condition: CICFlowMeter often leaves FIN Flag Cnt at 0 for the FIN that closes a tail flow
+    tail = (proto == "6").to_numpy() & (num("SYN Flag Cnt") == 0) & (num("RST Flag Cnt") == 0) & (packets <= 3)
     proto0 = (proto == "0").to_numpy() & ~arp
     flags = np.full(len(meta), "", dtype=object)
     flags[proto0] = "non_tcp_udp_protocol_0"

@@ -55,7 +55,7 @@ capture. No rows are added.
 Known CICFlowMeter 4.0 extraction artefacts are **flagged, never removed** (so the data stays comparable with
 Kaggle): `Extraction_Artefact` in `_provenance/` and per-file counts in `extraction_artefacts.csv`:
 `arp_misread_as_ipv4` (ARP frames read as IPv4; addresses 8.0.6.4 / 8.6.0.1), `tcp_fin_tail_candidate`
-(TCP flow without SYN, with FIN, ≤ 3 packets: the rest of a connection after CICFlowMeter closed the main flow
+(TCP flow of ≤ 3 packets without SYN or RST: the rest of a connection after CICFlowMeter closed the main flow
 at the first FIN) and `non_tcp_udp_protocol_0` (ICMP, IGMP or IP fragments, written as protocol 0).
 See `docs/cicflowmeter_extraction_audit.md`.
 

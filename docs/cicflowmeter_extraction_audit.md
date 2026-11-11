@@ -84,8 +84,35 @@ All packet differences below were accounted for exactly, capture by capture.
 Rows are kept exactly as CICFlowMeter wrote them, so the data stays comparable with the Kaggle release and
 with other work on MSCAD. Each row's `Extraction_Artefact` in `CSV_73Cols/_provenance/` names the artefact
 (`arp_misread_as_ipv4`, `tcp_fin_tail_candidate`, `non_tcp_udp_protocol_0`); `extraction_artefacts.csv`
-counts them per file. `tcp_fin_tail_candidate` is a rule on the written values (TCP, no SYN, at least one FIN,
-at most 3 packets) and is a candidate flag, not a packet-level proof. Whether to exclude or merge flagged rows
+counts them per file. `tcp_fin_tail_candidate` is a rule on the written values (TCP, at most 3 packets, no SYN,
+no RST) and is a candidate flag, not a packet-level proof. A FIN is deliberately not required: CICFlowMeter
+often does not count the FIN that closes a tail. In W-B-02, 44,163 two-packet tails show `FIN Flag Cnt` 0
+(one per connection, equal to the 44,163 trailing ACKs found in the packet audit), 23 two-packet tails and
+73 three-packet tails show 1. CICFlowMeter also counts both packets of some tails as backward
+(`Tot Fwd Pkts` 0; 302 of App-01's 307 tails).
+
+| Run on the re-extracted CSVs | arp_misread_as_ipv4 | non_tcp_udp_protocol_0 | tcp_fin_tail_candidate (FIN required, first version) |
+|---|---:|---:|---:|
+| N-0 | 0 | 0 | 4 |
+| App-01 | 1 | 0 | 302 |
+| App-02 | 1 | 33 | 0 |
+| Scan-1 | 2 | 3 | 25 |
+| W-B-01 | 0 | 2 | 2 |
+| W-B-02 | 1 | 0 | 96 |
+
+Final run (rule above, no FIN required; validation 133 PASS, 0 FAIL, 0 WARN, 100,342 rows):
+
+| Capture | Rows | arp_misread_as_ipv4 | non_tcp_udp_protocol_0 | tcp_fin_tail_candidate |
+|---|---:|---:|---:|---:|
+| N-0 | 21 | 0 | 0 | 6 |
+| App-01 | 641 | 1 | 0 | 307 |
+| App-02 | 45 | 1 | 33 | 0 |
+| Scan-1 | 11,081 | 2 | 3 | 259 |
+| W-B-01 | 28 | 0 | 2 | 5 |
+| W-B-02 | 88,526 | 1 | 0 | 44,259 |
+
+W-B-02: 44,259 tail candidates (23 + 44,163 two-packet and 73 three-packet rows) next to 44,257 main
+connection rows (12 or 10 packets), i.e. about one tail per connection. Whether to exclude or merge flagged rows
 is a modelling decision; for sequence mining, a tail flow follows its main flow within milliseconds and can be
 merged on the 5-tuple.
 
