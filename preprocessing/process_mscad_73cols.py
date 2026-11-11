@@ -11,9 +11,11 @@ Project : Flow-Aware Temporal Pattern Mining for Multi-Stage Network Intrusion D
 
 Inputs
 ------
-* Six CICFlowMeter v4.0 flow CSVs (one per MSCAD capture), default ``D:\\mscad\\CSV\\``.
-  Each file is processed INDEPENDENTLY. The six files are NEVER concatenated,
-  appended or merged.
+* Six CICFlowMeter v4.0 flow CSVs (one per MSCAD capture), default ``D:\\mscad\\CSV_REEXTRACTED\\``:
+  the command-line extraction (cfm.bat, Java 8) verified in Stage C to be reproducible. Each file is
+  processed INDEPENDENTLY. The six files are NEVER concatenated, appended or merged.
+  (The GUI extraction in ``D:\\mscad\\CSV`` is identical for five captures, but its W-B-01 file is damaged:
+  2 flows missing and 1 line cut. Using it makes W-B-01 fail with an explicit message.)
 * The original Kaggle ``MSCAD.csv`` (expected 128,799 rows x 67 columns), used ONLY
   as a read-only ground-truth lookup table. It is opened in read mode only, and its
   SHA-256 is checked before and after the run.
@@ -27,6 +29,7 @@ Outputs (default ``D:\\mscad\\CSV_73Cols\\``)
 * ``aggregated_class_verification.csv`` class-by-class Kaggle-vs-PCAP coverage reconciliation
 * ``capture_reconciliation.csv``      per-capture extracted vs Kaggle counts, status and message
 * ``input_repairs.csv``               malformed input lines that were realigned (empty if none)
+* ``extraction_artefacts.csv``        per-file counts of rows flagged as known CICFlowMeter artefacts
 * ``invalid_values_report.csv``       invalid numeric values per file and feature
 * ``schema_report.csv``               schema checks of the raw inputs
 * ``validation_checks.csv``           checks run after independently reloading the outputs
@@ -41,7 +44,7 @@ Labelling rules (verified per-capture ground truth), in priority order
 ---------------------------------------------------------------------
 1. Single-class captures are labelled by an authoritative capture rule
    (``capture_rule``): N-0 -> Normal (21), App-01 -> HTTP_DDoS (641),
-   App-02 -> ICMP_Flood (45), Scan-1 -> Port_Scan (11,081), W-B-01 -> Web_Crwling (26).
+   App-02 -> ICMP_Flood (45), Scan-1 -> Port_Scan (11,081), W-B-01 -> Web_Crwling (28).
    Signature matches are computed for these files only as diagnostics. A signature
    that the reference associates with another class (a collision) never changes a label.
 2. W-B-02 (expected: Brute_Force 88,526) is labelled by exact matching against
@@ -64,16 +67,31 @@ A line with exactly one field fewer than the header, whose values only line up w
 an empty leading Flow ID is inserted (integer ports/protocol, valid Dst IP, parseable
 timestamp, numeric features), is realigned in memory and listed in
 ``input_repairs.csv`` (the Src IP is kept as found and flagged if invalid). Any other
-malformed line fails its capture. Input files are never modified.
+malformed line fails its capture. Input files are never modified. The verified re-extracted CSVs contain no
+malformed lines; the repair exists only as a safety net (e.g. for the damaged GUI-extracted W-B-01 file,
+which is then still reported as a flow-count mismatch, because 2 of its flows are missing).
+
+CICFlowMeter extraction artefacts (flagged, never removed or changed)
+----------------------------------------------------------------------
+Rows are kept exactly as CICFlowMeter wrote them, so the data stays comparable with the Kaggle release. Each
+row's ``Extraction_Artefact`` in ``_provenance/`` names a known artefact of CICFlowMeter 4.0, verified in the
+Stage C packet-level audit (empty when none applies):
+* ``arp_misread_as_ipv4``      Src/Dst IP 8.0.6.4 / 8.6.0.1: ARP frames read as IPv4 at the wrong offset (the
+                               "addresses" are the ARP header bytes 08 00 06 04 and 08 06 00 01).
+* ``tcp_fin_tail_candidate``   TCP flow without SYN, with a FIN, of at most 3 packets: typically the remainder
+                               of a connection after CICFlowMeter closed the main flow at the first FIN.
+* ``non_tcp_udp_protocol_0``   any other Protocol 0 row: ICMP, IGMP or IP fragments, which CICFlowMeter writes
+                               as protocol 0 with ports 0 (e.g. the fragmented FIN scan in Scan-1 is one row).
+``extraction_artefacts.csv`` lists the counts per file. Flags are informational and never affect labels.
 
 Kaggle vs PCAP coverage
 -----------------------
-The six distributed captures yield 100,340 flows; MSCAD.csv has 128,799 rows.
+The six distributed captures yield 100,342 flows; MSCAD.csv has 128,799 rows.
 Class by class (each counted once): Normal 28,502 - 21 = 28,481 (N-0 is a 21-row
 baseline slice; Kaggle Normal aggregates background traffic across sessions),
-Web_Crwling 28 - 26 = 2, Brute_Force 88,502 - 88,526 = -24 (W-B-02: 8 extra copies
-of reference flows + 17 attack-session fragments - 1 reference row not reproduced).
-Total 28,481 + 2 - 24 = 28,459. ``capture_reconciliation.csv`` states, per capture,
+Brute_Force 88,502 - 88,526 = -24 (W-B-02: 8 extra copies of reference flows + 17
+attack-session fragments - 1 reference row not reproduced); Port_Scan, HTTP_DDoS,
+ICMP_Flood and Web_Crwling match exactly. Total 28,481 - 24 = 28,457. ``capture_reconciliation.csv`` states, per capture,
 the extracted and Kaggle counts and whether the difference is the documented one;
 any other difference fails as a labelling, flow-count or reference mismatch.
 
@@ -128,7 +146,7 @@ import pandas as pd
 # =============================================================================
 
 BASE_DIR = Path(r"D:\mscad")
-INPUT_SUBDIR = "CSV"
+INPUT_SUBDIR = "CSV_REEXTRACTED"
 OUTPUT_SUBDIR = "CSV_73Cols"
 
 # Set to an explicit path (e.g. Path(r"D:\mscad\MSCAD.csv")) to skip auto-discovery.
@@ -187,16 +205,15 @@ EXPECTED_CAPTURE_DISTRIBUTION = {
     "App-01.pcap_Flow.csv": {"HTTP_DDoS": 641},
     "App-02.pcap_Flow.csv": {"ICMP_Flood": 45},
     "Scan-1.pcap_Flow.csv": {"Port_Scan": 11_081},
-    "W-B-01.pcap_Flow.csv": {"Web_Crwling": 26},
+    "W-B-01.pcap_Flow.csv": {"Web_Crwling": 28},
     "W-B-02.pcap_Flow.csv": {"Brute_Force": 88_526},
 }
-EXPECTED_RAW_TOTAL = 100_340
+EXPECTED_RAW_TOTAL = 100_342
 
 # Documented differences between a capture and the Kaggle count of its class. A difference is accepted as
 # expected only if it equals Kaggle count - verified capture count AND the capture's labels equal the verified
 # distribution; anything else fails. (Status shown in capture_reconciliation.csv.)
 CAPTURE_VARIATION_STATUS = {
-    "W-B-01.pcap_Flow.csv": "Expected variation",
     "W-B-02.pcap_Flow.csv": "Reconciled",
     "N-0.pcap_Flow.csv": "Expected truncated baseline",
 }
@@ -205,10 +222,25 @@ CAPTURE_VARIATION_STATUS = {
 COVERAGE_NOTES = {
     "Normal": ("Kaggle Normal aggregates background traffic across capture sessions; the distributed N-0 PCAP "
                "is a 21-row baseline slice. Missing rows are not fabricated"),
-    "Web_Crwling": ("W-B-01.pcap yields 26 flows while Kaggle lists 28; the missing rows are not "
-                    "fabricated or inserted"),
     "Brute_Force": ("W-B-02 yields more flows than Kaggle: extra copies of reference flows and attack-session "
                     "fragments that the Kaggle extraction does not contain"),
+}
+
+# Known damaged inputs: (row count that identifies the damaged file, explanation). Used only to explain a
+# flow-count mismatch; it never changes the result.
+KNOWN_DAMAGED_INPUTS = {
+    "W-B-01.pcap_Flow.csv": (26, "this is the damaged GUI-extracted W-B-01 file (D:\\mscad\\CSV): 2 flows are missing "
+                                 "and 1 line lost its leading characters. Use the verified command-line extraction "
+                                 "(D:\\mscad\\CSV_REEXTRACTED, 28 flows)"),
+}
+
+# Known CICFlowMeter 4.0 extraction artefacts (Stage C audit). Flagged per row in _provenance/, never removed.
+ARP_MISREAD_ADDRESSES = {"8.0.6.4", "8.6.0.1"}
+ARTEFACT_FLAGS = {
+    "arp_misread_as_ipv4": "ARP frames read as IPv4 (Src/Dst IP 8.0.6.4 / 8.6.0.1 are ARP header bytes)",
+    "tcp_fin_tail_candidate": ("TCP flow without SYN, with FIN, <= 3 packets: typically the rest of a connection "
+                               "after CICFlowMeter closed the main flow at the first FIN"),
+    "non_tcp_udp_protocol_0": "ICMP, IGMP or IP fragments, written by CICFlowMeter as protocol 0 with ports 0",
 }
 
 assert set(ALLOWED_LABELS) == set(INPUT_FILES) == set(EXPECTED_CAPTURE_DISTRIBUTION)
@@ -1360,6 +1392,25 @@ def _new_result(filename: str, attack_label: str) -> dict:
     return {"filename": filename, "attack_label": attack_label, "status": "FAILED", "error": ""}
 
 
+def flag_extraction_artefacts(meta: pd.DataFrame, parsed: pd.DataFrame) -> np.ndarray:
+    """One flag per row naming a known CICFlowMeter artefact (see ARTEFACT_FLAGS), or "" when none applies.
+
+    Uses only values written by CICFlowMeter (addresses, protocol, packet and flag counts). Informational:
+    flags never change labels, features or row counts."""
+    src, dst = meta["Src IP"].str.strip(), meta["Dst IP"].str.strip()
+    proto = meta["Protocol"].str.strip()
+    num = lambda col: pd.to_numeric(parsed[col], errors="coerce").fillna(0).to_numpy()  # noqa: E731
+    packets = num("Tot Fwd Pkts") + num("Tot Bwd Pkts")
+    arp = (src.isin(ARP_MISREAD_ADDRESSES) & dst.isin(ARP_MISREAD_ADDRESSES)).to_numpy()
+    tail = (proto == "6").to_numpy() & (num("SYN Flag Cnt") == 0) & (num("FIN Flag Cnt") >= 1) & (packets <= 3)
+    proto0 = (proto == "0").to_numpy() & ~arp
+    flags = np.full(len(meta), "", dtype=object)
+    flags[proto0] = "non_tcp_udp_protocol_0"
+    flags[tail] = "tcp_fin_tail_candidate"
+    flags[arp] = "arp_misread_as_ipv4"
+    return flags
+
+
 def process_single_file(
     filename: str, lookup: pd.DataFrame, cfg: argparse.Namespace, full_lookup: pd.DataFrame | None = None
 ) -> dict:
@@ -1458,6 +1509,11 @@ def process_single_file(
 
     src_in, _ = classify_victim_subnet(meta["Src IP"])
     dst_in, _ = classify_victim_subnet(meta["Dst IP"])
+    artefacts = flag_extraction_artefacts(meta, parsed)
+    result["extraction_artefacts"] = {k: int((artefacts == k).sum()) for k in ARTEFACT_FLAGS}
+    if any(result["extraction_artefacts"].values()):
+        LOG.info("  extraction artefacts flagged (kept unchanged): %s",
+                 {k: v for k, v in result["extraction_artefacts"].items() if v})
 
     # Stage 3: invalid numeric values.
     cleaned, modified_per_row, modified_cells = clean_invalid_numeric_values(parsed, raw, int_columns, cfg.imputation)
@@ -1474,6 +1530,7 @@ def process_single_file(
             "Dst_In_Victim_Net": dst_in,
             "Invalid_Feature_Values": modified_per_row,
             "Input_Repair": pd.Series(input_row).map({r["Data row"]: r["Repair"] for r in repairs}).fillna("").to_numpy(),
+            "Extraction_Artefact": artefacts,
         }),
     ], axis=1)
     prov_cols = list(provenance.columns)
@@ -1549,6 +1606,7 @@ REPORT_CSV_FILES = (
     "validation_checks.csv",
     "capture_reconciliation.csv",
     "input_repairs.csv",
+    "extraction_artefacts.csv",
 )
 
 CHECK_CATEGORIES = {
@@ -1798,6 +1856,9 @@ def reconcile_captures(results: list[dict], reference_class_counts: dict) -> tup
         elif counts != expected:
             status, passed = "Labelling mismatch", False
             message = f"{short}: labels {counts} differ from the verified distribution {expected}."
+            damaged = KNOWN_DAMAGED_INPUTS.get(fname)
+            if damaged and n == damaged[0]:
+                message += f" {n:,} rows: {damaged[1]}."
         elif kaggle != EXPECTED_CLASS_COUNTS[cls]:
             status, passed = "Reference mismatch", False
             message = f"{short}: Kaggle {cls} count {kaggle:,} differs from the verified {EXPECTED_CLASS_COUNTS[cls]:,}."
@@ -1894,6 +1955,7 @@ def _summary_row(res: dict) -> dict:
         "Rows Exceeding Reference Multiplicity": "" if single else lab.get("rows_exceeding_reference_multiplicity", ""),
         "Unresolved Rows": res.get("unresolved_rows", 0 if ok else ""),
         "Repaired Input Lines": len(res.get("input_repairs", [])),
+        **{f"Artefact: {k}": res.get("extraction_artefacts", {}).get(k, "") for k in ARTEFACT_FLAGS},
         "Invalid Numeric Values": res.get("invalid_numeric_values", ""),
         "Rows With Invalid Values": res.get("rows_with_invalid_values", ""),
         "Imputed Cells": res.get("imputed_cells", ""),
@@ -1940,6 +2002,11 @@ def generate_verification_report(results, checks, ref_info, lookup_stats, cfg, r
     pd.DataFrame(repair_rows, columns=["Filename", "CSV line", "Data row", "Fields found", "Header fields", "Repair",
                                        "Src IP as found", "Src IP valid", "Original line start"]) \
         .to_csv(out / "input_repairs.csv", index=False, encoding="utf-8")
+    artefact_rows = [{"Filename": r["filename"], "Flag": k, "Rows": r.get("extraction_artefacts", {}).get(k, 0),
+                      "Output Rows": r.get("output_rows", ""), "Meaning": meaning}
+                     for r in results if r["status"] == "OK" for k, meaning in ARTEFACT_FLAGS.items()]
+    pd.DataFrame(artefact_rows, columns=["Filename", "Flag", "Rows", "Output Rows", "Meaning"]) \
+        .to_csv(out / "extraction_artefacts.csv", index=False, encoding="utf-8")
 
     inv_rows = []
     for r in results:
@@ -2028,6 +2095,13 @@ def _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cf
         "Input lines that lack exactly their leading Flow ID field are realigned one column before processing "
         "(listed in `input_repairs.csv`); any other malformed line fails its capture.",
         "",
+        "## CICFlowMeter extraction artefacts (flagged in `_provenance/`, rows kept unchanged)",
+        "",
+        _md_table(pd.DataFrame([{"Filename": r["Filename"], **{k: r.get(f"Artefact: {k}", "") for k in ARTEFACT_FLAGS}}
+                                for _, r in summary.iterrows()])),
+        "",
+        *[f"* `{k}`: {v}" for k, v in ARTEFACT_FLAGS.items()],
+        "",
         "Per-row label source: `_provenance/`.",
         "",
         "## Per-file summary",
@@ -2071,7 +2145,7 @@ def _write_markdown_report(summary, coverage, checks, ref_info, lookup_stats, cf
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MSCAD CICFlowMeter CSVs -> six labelled 73-column CSVs")
     p.add_argument("--base-dir", type=Path, default=BASE_DIR, help=f"project directory (default {BASE_DIR})")
-    p.add_argument("--input-dir", type=Path, default=None, help="default <base-dir>/CSV")
+    p.add_argument("--input-dir", type=Path, default=None, help=f"default <base-dir>/{INPUT_SUBDIR}")
     p.add_argument("--output-dir", type=Path, default=None, help="default <base-dir>/CSV_73Cols")
     p.add_argument("--reference", type=Path, default=REFERENCE_CSV_PATH, help="path to the Kaggle MSCAD.csv")
     p.add_argument("--search-root", type=Path, action="append", default=[],
