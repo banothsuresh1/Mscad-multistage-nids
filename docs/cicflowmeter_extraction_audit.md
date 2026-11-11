@@ -100,7 +100,19 @@ often does not count the FIN that closes a tail. In W-B-02, 44,163 two-packet ta
 | W-B-01 | 0 | 2 | 2 |
 | W-B-02 | 1 | 0 | 96 |
 
-With the rule above (no FIN required) the W-B-02 count is about 44,259 and the App-01 count about 307. Whether to exclude or merge flagged rows
+Final run (rule above, no FIN required; validation 133 PASS, 0 FAIL, 0 WARN, 100,342 rows):
+
+| Capture | Rows | arp_misread_as_ipv4 | non_tcp_udp_protocol_0 | tcp_fin_tail_candidate |
+|---|---:|---:|---:|---:|
+| N-0 | 21 | 0 | 0 | 6 |
+| App-01 | 641 | 1 | 0 | 307 |
+| App-02 | 45 | 1 | 33 | 0 |
+| Scan-1 | 11,081 | 2 | 3 | 259 |
+| W-B-01 | 28 | 0 | 2 | 5 |
+| W-B-02 | 88,526 | 1 | 0 | 44,259 |
+
+W-B-02: 44,259 tail candidates (23 + 44,163 two-packet and 73 three-packet rows) next to 44,257 main
+connection rows (12 or 10 packets), i.e. about one tail per connection. Whether to exclude or merge flagged rows
 is a modelling decision; for sequence mining, a tail flow follows its main flow within milliseconds and can be
 merged on the 5-tuple.
 
