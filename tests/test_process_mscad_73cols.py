@@ -139,9 +139,10 @@ def build_reference(rng) -> tuple[pd.DataFrame, dict]:
     copy_rows(ref, N[5:10], H[0:5], FEAT)      # all 66 features shared by HTTP_DDoS and Normal
     copy_rows(ref, P[0:1], B[10:11], FEAT)     # Port_Scan reference row identical to a Brute_Force row
     copy_rows(ref, B[21:22], B[20:21], FEAT)   # duplicated Brute_Force reference row
-    tail = B[TAIL_ROWS]                        # 2-packet TCP flows without SYN, with FIN (FIN-tail artefacts)
+    tail = B[TAIL_ROWS]                        # 2-packet TCP flows without SYN or RST (FIN-tail artefacts)
     ref.loc[tail, "SYN Flag Cnt"] = 0.0
-    ref.loc[tail, "FIN Flag Cnt"] = 1.0
+    ref.loc[tail, "RST Flag Cnt"] = 0.0
+    ref.loc[tail, "FIN Flag Cnt"] = 0.0          # as CICFlowMeter writes most tails: the closing FIN not counted
     ref.loc[tail, "Tot Fwd Pkts"] = 1.0
     ref.loc[tail, "Tot Bwd Pkts"] = 1.0
     return ref, idx
@@ -835,22 +836,28 @@ def test_unrepairable_malformed_lines_fail():
 
 
 def test_flag_extraction_artefacts_rules():
+    # rows shaped like the real W-B-02/App-01 values (see docs/cicflowmeter_extraction_audit.md)
     meta = pd.DataFrame({
-        "Src IP": ["8.0.6.4", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1", "8.6.0.1"],
-        "Dst IP": ["8.6.0.1", "10.0.0.2", "10.0.0.2", "10.0.0.2", "10.0.0.2", "10.0.0.2", "10.0.0.2"],
-        "Protocol": ["0", "6", "6", "6", "0", "17", "0"],
+        "Src IP": ["8.0.6.4", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1",
+                   "10.0.0.1", "8.6.0.1"],
+        "Dst IP": ["8.6.0.1"] + ["10.0.0.2"] * 9,
+        "Protocol": ["0", "6", "6", "6", "6", "6", "6", "0", "17", "0"],
     })
     parsed = pd.DataFrame({
-        "Tot Fwd Pkts": [10, 1, 7, 2, 4, 1, 3], "Tot Bwd Pkts": [1, 1, 5, 2, 0, 1, 0],
-        "SYN Flag Cnt": [0, 0, 1, 0, 0, 0, 0], "FIN Flag Cnt": [0, 1, 1, 1, 0, 1, 0],
+        "Tot Fwd Pkts": [10, 1, 0, 1, 7, 2, 1, 4, 1, 3], "Tot Bwd Pkts": [1, 1, 2, 2, 5, 2, 0, 0, 1, 0],
+        "SYN Flag Cnt": [0, 0, 0, 0, 1, 0, 0, 0, 0, 0], "FIN Flag Cnt": [0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+        "RST Flag Cnt": [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
     }, dtype=float)
     flags = list(pm.flag_extraction_artefacts(meta, parsed))
     assert flags == ["arp_misread_as_ipv4",       # both ARP "addresses"
-                     "tcp_fin_tail_candidate",    # TCP, no SYN, FIN, 2 packets
+                     "tcp_fin_tail_candidate",    # 2 packets, no SYN, FIN not counted (most W-B-02 tails)
+                     "tcp_fin_tail_candidate",    # 2 packets counted backward, FIN counted (App-01 tails)
+                     "tcp_fin_tail_candidate",    # 3 packets, no SYN
                      "",                          # full TCP connection
                      "",                          # 4 packets: not a tail candidate
+                     "",                          # a reset, not a tail
                      "non_tcp_udp_protocol_0",    # ICMP/IGMP/fragments
-                     "",                          # UDP with a FIN count is impossible but never a TCP tail
+                     "",                          # UDP is never a TCP tail
                      "non_tcp_udp_protocol_0"]    # only one ARP address: an ordinary protocol-0 row
 
 
